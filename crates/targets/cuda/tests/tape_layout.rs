@@ -3129,3 +3129,50 @@ fn the_glm_not_launched_tapes_validate() {
         }
     }
 }
+
+/// A dense MoE bundle a GLM routing reads its correction bias from has no weight-table entry CUDA
+/// loads (GLM-4.5-Air's CUDA path is its affine checkpoint, #948): [`glm_moe`] at m = 512 through
+/// `lower_model`, its bundle a model weight with a prefix, is refused as
+/// `ModelRefusal::NoBiasedBundle` naming the bundle's index.
+#[test]
+fn a_dense_biased_glm_bundle_is_refused_in_the_weight_table() {
+    use scratchy_subtile::handoff::{
+        TargetBucket, TargetModelFacts, TargetModelInput, TargetPoint,
+    };
+    use scratchy_target_cuda_compiler::emit::{ModelRefusal, lower_model};
+    let lowered = glm_moe(512);
+    assert!(
+        matches!(
+            lowered.bindings[1],
+            SourceBinding::Weight { id: 1, index: None }
+        ),
+        "{:?}",
+        lowered.bindings[1]
+    );
+    let input = TargetModelInput {
+        stem: "glm_moe".to_string(),
+        arch: "glm4-moe".to_string(),
+        buckets: vec![TargetBucket {
+            point: TargetPoint { m: 512, sk: 1 },
+            lowered,
+        }],
+        unlowered: Vec::new(),
+        facts: TargetModelFacts {
+            head_dim: 0,
+            rot_dim: 0,
+            rope_theta: None,
+            rms_norm_eps: 1e-5,
+            vocab_size: 256,
+            gdn: None,
+            dsl_shared_expert_bases: vec!["mlp".to_string()],
+            attn_classes: Vec::new(),
+        },
+        weight_prefixes: vec![(1, None, "model.layers.1.mlp".to_string())],
+        embed_prefix: Some("model.embed_tokens".to_string()),
+        bundle_tensor_names: Vec::new(),
+    };
+    let e = lower_model(&input).expect_err("a dense biased bundle has no loader");
+    eprintln!("refused: {e}");
+    assert!(e.to_string().contains("GLM correction bias"), "{e}");
+    assert!(matches!(e, ModelRefusal::NoBiasedBundle { ix: 1 }), "{e:?}");
+}
