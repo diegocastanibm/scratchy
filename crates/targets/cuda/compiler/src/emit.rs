@@ -263,6 +263,10 @@ pub enum ModelRefusal {
         first: usize,
         tensor: String,
     },
+    /// Weight `ix` is a dense MoE bundle a GLM routing reads its correction bias from
+    /// (`step::moe_bundle_biased`), which no weight-table entry loads: the GLM checkpoint in
+    /// scope is affine (#948), and the dense per-expert form is not loaded.
+    NoBiasedBundle { ix: usize },
 }
 
 impl std::fmt::Display for ModelRefusal {
@@ -333,6 +337,11 @@ impl std::fmt::Display for ModelRefusal {
             Self::SharedTensor { ix, first, tensor } => write!(
                 f,
                 "weights {first} and {ix} name the checkpoint tensor {tensor} as different entries"
+            ),
+            Self::NoBiasedBundle { ix } => write!(
+                f,
+                "weight {ix} is a dense MoE bundle with a GLM correction bias, which the CUDA \
+                 loader does not take (GLM-4.5-Air's CUDA path is its affine 4-bit checkpoint)"
             ),
         }
     }
@@ -785,16 +794,11 @@ pub fn weight_table(
                 hidden,
                 inter,
             },
-            // GLM's checkpoint stores each expert's projections as tensors of their own, which
-            // the loader stacks into the bundle's layout, and the router's correction bias in f32.
-            Role::MoeBundleBiased([experts, hidden, inter]) => CudaWeight::MoeBundleStacked {
-                router: baked_str(format!("{prefix}.gate.weight")),
-                experts_prefix: baked_str(format!("{prefix}.experts")),
-                correction_bias: baked_str(format!("{prefix}.gate.e_score_correction_bias")),
-                experts,
-                hidden,
-                inter,
-            },
+            // A dense bundle with GLM's correction bias appended has no checkpoint form CUDA
+            // loads: GLM-4.5-Air ships affine (#948), and no bf16 GLM checkpoint is in scope.
+            Role::MoeBundleBiased(_) => {
+                return Err(ModelRefusal::NoBiasedBundle { ix });
+            }
             // An expert bank is read only through bundle tensors, named above.
             Role::ExpertBank(_) => {
                 return Err(ModelRefusal::NoPrefix {
