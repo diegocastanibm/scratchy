@@ -7407,6 +7407,69 @@ fn target_model_input(
             Some((id, index, tensor, format!("{prefix}.{leaf}")))
         })
         .collect();
+    // Each MLX-affine MoE bundle a canonical binds: the weight a `RouterLogits` reads, its storage
+    // plan from `moe_affine_plan` (the function metal's `FieldLoad::SharedFusedMoe` reads), and its
+    // tensors' full names (the bundle's prefix, then each `AFFINE_BUNDLE_LEAVES` leaf).
+    let moe_bundles: std::collections::BTreeSet<(u32, Option<UnrollIndex>)> = (buckets.iter())
+        .flat_map(|b| {
+            let l = &b.lowered;
+            (l.input.ops.iter()).filter_map(move |od| match od.op {
+                scratchy_subtile::subtile_ir::SubOp::RouterLogits { .. } => {
+                    od.inputs.iter().find_map(|i| match *i {
+                        scratchy_subtile::lower::InputRef::Ext(e) => match l.bindings[e] {
+                            scratchy_subtile::handoff::SourceBinding::Weight { id, index } => {
+                                Some((id, index))
+                            }
+                            _ => None,
+                        },
+                        scratchy_subtile::lower::InputRef::Op(_) => None,
+                    })
+                }
+                _ => None,
+            })
+        })
+        .collect();
+    let mut moe_affine = Vec::new();
+    let mut affine_bundle_names = Vec::new();
+    for (id, index) in moe_bundles {
+        let prefix = safetensors_prefix(program.weight_naming(), &model.arch, WeightId(id), index);
+        let accessor = WeightAccessor {
+            name: quote::format_ident!("__target_moe_bundle"),
+            rust_type: TokenStream::new(),
+            source_weights: vec![(WeightId(id), index)],
+        };
+        let (Some((group_size, expert)), router) =
+            moe_affine_plan(program, fuf, model, &prefix, &accessor)
+        else {
+            continue;
+        };
+        moe_affine.push((
+            id,
+            index,
+            scratchy_subtile::handoff::TargetMoeAffine {
+                group_size,
+                router,
+                experts: expert.projections(),
+            },
+        ));
+        for &(tensor, leaf) in scratchy_subtile::handoff::AFFINE_BUNDLE_LEAVES {
+            affine_bundle_names.push((id, index, tensor, format!("{prefix}.{leaf}")));
+        }
+    }
+    // The embedding table's storage, as metal's `embed_quant` reads it: the `Embed` node's weight.
+    let embed_affine =
+        fuf.nodes.iter().find_map(
+            |n| match (n.op, crate::weight_vocab::weight_storage_of(n)) {
+                (
+                    OpKind::Embed,
+                    Some(crate::quantization::StorageFormat::Affine { group_size, bits }),
+                ) => Some(scratchy_subtile::handoff::TargetAffine {
+                    group_size: *group_size,
+                    bits: *bits,
+                }),
+                _ => None,
+            },
+        );
     let sliding = (fuf.nodes.iter()).any(|n| {
         matches!(
             n.op,
@@ -7429,6 +7492,8 @@ fn target_model_input(
         weight_prefixes,
         embed_prefix: lent_weight_prefix(program, fuf, model, LentWeight::EmbedTokens),
         bundle_tensor_names,
+        moe_affine,
+        affine_bundle_names,
         facts: TargetModelFacts {
             head_dim,
             rot_dim: rot_dim(model, head_dim),
@@ -7438,6 +7503,7 @@ fn target_model_input(
             gdn,
             dsl_shared_expert_bases: program.weights.shared_expert_bases(),
             attn_classes,
+            embed_affine,
         },
     }
 }

@@ -1050,6 +1050,7 @@ fn tied_model(ms: &[u32], head: &str, vocab: u32) -> TargetModelInput {
             gdn: None,
             dsl_shared_expert_bases: Vec::new(),
             attn_classes: Vec::new(),
+            embed_affine: None,
         },
         weight_prefixes: vec![
             (1, None, "model.norm".to_string()),
@@ -1057,6 +1058,8 @@ fn tied_model(ms: &[u32], head: &str, vocab: u32) -> TargetModelInput {
         ],
         embed_prefix: Some("model.embed_tokens".to_string()),
         bundle_tensor_names: Vec::new(),
+        moe_affine: Vec::new(),
+        affine_bundle_names: Vec::new(),
     }
 }
 

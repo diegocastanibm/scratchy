@@ -276,6 +276,14 @@ pub enum QuantMethod {
         /// for uniform / suffix-preset checkpoints, which keep the
         /// `bits` + `bits_overrides` path.
         per_module: Vec<(String, (u32, u32))>,
+        /// The section's `modules_to_not_convert`: each a module's leaf
+        /// path after its layer prefix (`mlp.gate`), whose role
+        /// [`affine_role_widths`] resolves dense — matched exactly, never
+        /// as a substring. A bundle's sub-weight (GLM-4.5-Air's router,
+        /// which mlx-lm's `MoEGate` never converts) has no `WeightId` of
+        /// its own for `storage_format_for_weight`'s whole-weight list to
+        /// reach. Sorted; empty for every other checkpoint.
+        dense_roles: Vec<String>,
     },
     /// NVIDIA ModelOpt NVFP4. Detected via `quant_method: "modelopt"`
     /// (or no `quant_method` in a standalone `hf_quant_config.json`)
@@ -566,7 +574,12 @@ fn parse_affine_no_method(
     for (key, val) in obj {
         if matches!(
             key.as_str(),
-            "bits" | "group_size" | "mode" | "bits_overrides" | "quant_embed"
+            "bits"
+                | "group_size"
+                | "mode"
+                | "bits_overrides"
+                | "quant_embed"
+                | "modules_to_not_convert"
         ) {
             continue;
         }
@@ -616,12 +629,35 @@ fn parse_affine_no_method(
         .get("quant_embed")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // The modules the checkpoint leaves dense, as `QuantizationConfig::parse`
+    // also reads them for whole weights: here so the per-role resolver
+    // ([`affine_role_widths`]) sees them for a bundle's sub-weight too.
+    let mut dense_roles: Vec<String> = match obj.get("modules_to_not_convert") {
+        None => Vec::new(),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .map(|v| {
+                v.as_str().map(str::to_string).ok_or(ParseError::BadField {
+                    field: "modules_to_not_convert",
+                    reason: "each entry must be a module path string",
+                })
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => {
+            return Err(ParseError::BadField {
+                field: "modules_to_not_convert",
+                reason: "must be an array of module path strings",
+            });
+        }
+    };
+    dense_roles.sort();
     Ok(QuantMethod::Affine {
         bits,
         group_size,
         quantize_embed,
         bits_overrides,
         per_module,
+        dense_roles,
     })
 }
 
@@ -1166,9 +1202,17 @@ pub fn affine_role_widths(
         group_size,
         bits_overrides,
         per_module,
+        dense_roles,
         ..
     } = method
     {
+        // A module the checkpoint leaves dense: its leaf after the layer
+        // prefix, matched exactly (`mlp.gate`, never `mlp.gate_proj`).
+        let leaf = disk_role_dotted(program, dotted_role);
+        let leaf = strip_templated_layer_prefix(&leaf);
+        if dense_roles.iter().any(|r| r == leaf) {
+            return None;
+        }
         if !per_module.is_empty() {
             return per_module_lookup(program, per_module, dotted_role, index).map(|(b, g)| (g, b));
         }
@@ -1627,12 +1671,15 @@ pub fn storage_format_for_weight(
         },
         QuantMethod::Fp8 { scheme, block_size } => StorageFormat::Fp8 { scheme, block_size },
         QuantMethod::Ggml => StorageFormat::Ggml,
+        // `dense_roles` is the section's `modules_to_not_convert`, which the
+        // whole-weight check above already applied to this weight.
         QuantMethod::Affine {
             bits,
             group_size,
             quantize_embed: _,
             ref bits_overrides,
             ref per_module,
+            dense_roles: _,
         } => {
             // MLX-native mixed / dynamic quant (OptiQ): membership in the
             // per-module map is authoritative and each weight carries its
@@ -2335,6 +2382,7 @@ mod tests {
             quantize_embed: false,
             bits_overrides: Vec::new(),
             per_module: vec![("backbone.embeddings".to_string(), (8, 64))],
+            dense_roles: Vec::new(),
         };
         assert_eq!(affine_embed_bits(&method, "embeddings"), Some(8));
         assert_eq!(affine_embed_bits(&method, "embed_tokens"), Some(2));
@@ -2446,6 +2494,7 @@ mod tests {
             quantize_embed: true,
             bits_overrides: vec![("embed_tokens".to_string(), 4)],
             per_module: Vec::new(),
+            dense_roles: Vec::new(),
         };
         assert_eq!(affine_embed_bits(&method, "embed_tokens"), Some(4));
 
@@ -2456,6 +2505,7 @@ mod tests {
             quantize_embed: true,
             bits_overrides: vec![("embed_tokens".to_string(), 4)],
             per_module: vec![("model.embed_tokens".to_string(), (8, 64))],
+            dense_roles: Vec::new(),
         };
         assert_eq!(affine_embed_bits(&method, "embed_tokens"), Some(8));
 
@@ -2466,6 +2516,7 @@ mod tests {
             quantize_embed: true,
             bits_overrides: Vec::new(),
             per_module: Vec::new(),
+            dense_roles: Vec::new(),
         };
         assert_eq!(affine_embed_bits(&method, "embed_tokens"), Some(2));
     }

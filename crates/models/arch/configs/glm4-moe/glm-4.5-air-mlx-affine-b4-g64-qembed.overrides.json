@@ -1,0 +1,6 @@
+{
+  "_comment": "Per-(stem, preset) drift: `mlx-community/GLM-4.5-Air-4bit` (60837794f3caafc4682dd1a9188a82c55a9100ef) is 4-bit/g64 everywhere EXCEPT the MoE router, which it ships dense: `mlp.gate.weight [128, 4096]` BF16 with no `.scales` sibling, on every MoE layer, although its config states the section default and no per-module override. mlx-lm's `glm4_moe.MoEGate` holds a bare `weight` parameter, not an `nn.Linear`, so `nn.quantize` never converts it. Declared here, per checkpoint, so the router's dense storage is a compile-time fact (#947) and no other GLM checkpoint is affected.",
+  "quantization_config": {
+    "modules_to_not_convert": ["mlp.gate"]
+  }
+}

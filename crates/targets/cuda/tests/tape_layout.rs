@@ -2690,10 +2690,13 @@ fn gemma_moe_model(
             gdn: None,
             dsl_shared_expert_bases: Vec::new(),
             attn_classes: Vec::new(),
+            embed_affine: None,
         },
         weight_prefixes: Vec::new(),
         embed_prefix: Some("m.embed_tokens".to_string()),
         bundle_tensor_names: names,
+        moe_affine: Vec::new(),
+        affine_bundle_names: Vec::new(),
     }
 }
 
@@ -3166,10 +3169,13 @@ fn a_dense_biased_glm_bundle_is_refused_in_the_weight_table() {
             gdn: None,
             dsl_shared_expert_bases: vec!["mlp".to_string()],
             attn_classes: Vec::new(),
+            embed_affine: None,
         },
         weight_prefixes: vec![(1, None, "model.layers.1.mlp".to_string())],
         embed_prefix: Some("model.embed_tokens".to_string()),
         bundle_tensor_names: Vec::new(),
+        moe_affine: Vec::new(),
+        affine_bundle_names: Vec::new(),
     };
     let e = lower_model(&input).expect_err("a dense biased bundle has no loader");
     eprintln!("refused: {e}");

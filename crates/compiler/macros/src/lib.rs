@@ -234,6 +234,7 @@ fn dedup_quant_sig(method: Option<&crate::quantization::QuantMethod>) -> String 
             quantize_embed,
             bits_overrides,
             per_module,
+            dense_roles,
         }) => {
             let qe = if *quantize_embed { "-qe" } else { "" };
             // The per-role (`bits_overrides`) and per-module (`per_module`,
@@ -256,7 +257,13 @@ fn dedup_quant_sig(method: Option<&crate::quantization::QuantMethod>) -> String 
                 .map(|(k, (b, g))| format!("{k}={b}/{g}"))
                 .collect::<Vec<_>>()
                 .join(",");
-            format!("q:affine-b{bits}-g{group_size}{qe}|ov[{ov}]|pm[{pm}]")
+            // The roles left dense change which loads are emitted (a dense router, #947); an
+            // empty list adds nothing, so every other variant's signature is unchanged.
+            let dr = match dense_roles.is_empty() {
+                true => String::new(),
+                false => format!("|dr[{}]", dense_roles.join(",")),
+            };
+            format!("q:affine-b{bits}-g{group_size}{qe}|ov[{ov}]|pm[{pm}]{dr}")
         }
         Some(crate::quantization::QuantMethod::Nvfp4 { group_size }) => {
             format!("q:nvfp4-g{group_size}")

@@ -83,6 +83,60 @@ pub const BUNDLE_TENSOR_LEAVES: &[(BundleTensor, &str)] = &[
     (BundleTensor::ExpertDownW, "down_proj"),
 ];
 
+/// An MLX-affine MoE bundle's checkpoint tensors, by role, as the leaf after the bundle's
+/// checkpoint prefix (`…layers.N.mlp`): the router (`gate.weight`, stored dense or packed as the
+/// bundle's [`TargetMoeAffine::router`] says), its f32 score correction bias, and each
+/// pre-stacked expert projection (`switch_mlp.*`, mlx-lm's `SwitchGLU`) as its packed `weight`,
+/// `scales` and `biases`. The target-emitter handoff names every one in full
+/// ([`TargetModelInput::affine_bundle_names`]). The order is the bundle's own: router, bias, then
+/// gate, up and down, each weight, scales, biases.
+pub const AFFINE_BUNDLE_LEAVES: &[(AffineBundleTensor, &str)] = &[
+    (AffineBundleTensor::Router, "gate.weight"),
+    (
+        AffineBundleTensor::CorrectionBias,
+        "gate.e_score_correction_bias",
+    ),
+    (AffineBundleTensor::GateW, "switch_mlp.gate_proj.weight"),
+    (
+        AffineBundleTensor::GateScales,
+        "switch_mlp.gate_proj.scales",
+    ),
+    (
+        AffineBundleTensor::GateBiases,
+        "switch_mlp.gate_proj.biases",
+    ),
+    (AffineBundleTensor::UpW, "switch_mlp.up_proj.weight"),
+    (AffineBundleTensor::UpScales, "switch_mlp.up_proj.scales"),
+    (AffineBundleTensor::UpBiases, "switch_mlp.up_proj.biases"),
+    (AffineBundleTensor::DownW, "switch_mlp.down_proj.weight"),
+    (
+        AffineBundleTensor::DownScales,
+        "switch_mlp.down_proj.scales",
+    ),
+    (
+        AffineBundleTensor::DownBiases,
+        "switch_mlp.down_proj.biases",
+    ),
+];
+
+/// One checkpoint tensor of an MLX-affine MoE bundle ([`AFFINE_BUNDLE_LEAVES`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AffineBundleTensor {
+    /// `[experts, hidden]`: the router projection.
+    Router,
+    /// `[experts]` f32: the router's score correction bias (DeepSeek-V3's noaux_tc).
+    CorrectionBias,
+    GateW,
+    GateScales,
+    GateBiases,
+    UpW,
+    UpScales,
+    UpBiases,
+    DownW,
+    DownScales,
+    DownBiases,
+}
+
 /// Whole-segment suffix rewrites of a bundle's checkpoint prefix, before its tensor's leaf
 /// ([`BUNDLE_TENSOR_LEAVES`]): the DSL's `experts.switch_glu` is MLX's layout, and the HF
 /// checkpoint keeps the experts at `experts`. Read only by the bundle-tensor names of the
@@ -373,6 +427,31 @@ pub struct TargetModelInput {
     /// that [`BUNDLE_TENSOR_LEAVES`] names, and its full checkpoint tensor name: the bundle's
     /// prefix, rewritten by [`BUNDLE_PREFIX_REWRITES`], then the tensor's leaf.
     pub bundle_tensor_names: Vec<(u32, Option<UnrollIndex>, BundleTensor, String)>,
+    /// Each MoE bundle a canonical binds (`SourceBinding::Weight { id, index }`) whose storage is
+    /// MLX-affine, and its storage plan: the resolver's own answer, never re-derived. Empty for a
+    /// dense model.
+    pub moe_affine: Vec<(u32, Option<UnrollIndex>, TargetMoeAffine)>,
+    /// Each tensor of those bundles that [`AFFINE_BUNDLE_LEAVES`] names, in full: the bundle's
+    /// checkpoint prefix, then the leaf. Empty for a dense model.
+    pub affine_bundle_names: Vec<(u32, Option<UnrollIndex>, AffineBundleTensor, String)>,
+}
+
+/// One MLX-affine MoE bundle's storage: the group along K, the router's width (`None`: the
+/// checkpoint ships it dense), and each routed-expert projection's width, gate, up and down
+/// (`None`: a projection the bank does not have).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TargetMoeAffine {
+    pub group_size: u32,
+    pub router: Option<u32>,
+    pub experts: [Option<u32>; 3],
+}
+
+/// One MLX-affine storage: `group_size` consecutive input elements share a scale and a bias, each
+/// element `bits` wide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TargetAffine {
+    pub group_size: u32,
+    pub bits: u32,
 }
 
 /// One workload point: `m` token rows, `sk` the KV-length bucket.
@@ -416,6 +495,9 @@ pub struct TargetModelFacts {
     /// to [`Self::head_dim`], [`Self::rot_dim`] and [`Self::rope_theta`]. Which class a layer is
     /// is its attention ops' own fact: their mask's window and their head dim.
     pub attn_classes: Vec<TargetAttnClass>,
+    /// The token-embedding table's storage: `Some` when the checkpoint ships it MLX-affine
+    /// packed, `None` when it is dense.
+    pub embed_affine: Option<TargetAffine>,
 }
 
 /// One attention class's geometry: what a layer of it rotates, caches and masks.
