@@ -7413,20 +7413,26 @@ fn target_model_input(
     let moe_bundles: std::collections::BTreeSet<(u32, Option<UnrollIndex>)> = (buckets.iter())
         .flat_map(|b| {
             let l = &b.lowered;
-            (l.input.ops.iter()).filter_map(move |od| match od.op {
-                scratchy_subtile::subtile_ir::SubOp::RouterLogits { .. } => {
-                    od.inputs.iter().find_map(|i| match *i {
-                        scratchy_subtile::lower::InputRef::Ext(e) => match l.bindings[e] {
-                            scratchy_subtile::handoff::SourceBinding::Weight { id, index } => {
-                                Some((id, index))
-                            }
-                            _ => None,
-                        },
-                        scratchy_subtile::lower::InputRef::Op(_) => None,
+            (l.input.ops.iter())
+                .filter(|od| {
+                    matches!(
+                        od.op,
+                        scratchy_subtile::subtile_ir::SubOp::RouterLogits { .. }
+                    )
+                })
+                .filter_map(move |od| {
+                    od.inputs.iter().find_map(|i| {
+                        let scratchy_subtile::lower::InputRef::Ext(e) = *i else {
+                            return None;
+                        };
+                        let scratchy_subtile::handoff::SourceBinding::Weight { id, index } =
+                            l.bindings[e]
+                        else {
+                            return None;
+                        };
+                        Some((id, index))
                     })
-                }
-                _ => None,
-            })
+                })
         })
         .collect();
     let mut moe_affine = Vec::new();
@@ -7457,19 +7463,19 @@ fn target_model_input(
         }
     }
     // The embedding table's storage, as metal's `embed_quant` reads it: the `Embed` node's weight.
-    let embed_affine =
-        fuf.nodes.iter().find_map(
-            |n| match (n.op, crate::weight_vocab::weight_storage_of(n)) {
-                (
-                    OpKind::Embed,
-                    Some(crate::quantization::StorageFormat::Affine { group_size, bits }),
-                ) => Some(scratchy_subtile::handoff::TargetAffine {
-                    group_size: *group_size,
-                    bits: *bits,
-                }),
-                _ => None,
-            },
-        );
+    let embed_affine = (fuf.nodes.iter())
+        .filter(|n| n.op == OpKind::Embed)
+        .find_map(|n| {
+            let Some(crate::quantization::StorageFormat::Affine { group_size, bits }) =
+                crate::weight_vocab::weight_storage_of(n)
+            else {
+                return None;
+            };
+            Some(scratchy_subtile::handoff::TargetAffine {
+                group_size: *group_size,
+                bits: *bits,
+            })
+        });
     let sliding = (fuf.nodes.iter()).any(|n| {
         matches!(
             n.op,
