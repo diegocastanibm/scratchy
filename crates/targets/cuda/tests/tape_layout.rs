@@ -10,6 +10,7 @@ mod common {
     pub mod chains;
     pub mod gdn_layer;
     pub mod gemma_moe;
+    pub mod glm_moe;
     pub mod mlp;
 }
 
@@ -2850,5 +2851,251 @@ fn a_gemma_v_norm_lowers_one_row_per_kv_head() {
         vnorm_shape(&vnorm(4, 2048), GEMMA4_FACTS),
         (4, 2048),
         "a uniform model's unit norm stays whole"
+    );
+}
+
+// ── GLM-4.5-Air's new steps (#938, 14a) ────────────────────────────
+
+use common::glm_moe::{GLM_ATTN_FACTS, GLM_MOE_FACTS, glm_attn, glm_moe};
+use scratchy_target_cuda::step::{BiasAddBf16, moe_bundle_biased};
+
+/// GLM's attention prelude at head dim 128 lowers at one row and at 128: each q, k and v
+/// projection is a GEMM (or GEMV) then a `BiasAdd` of its `[cols]` bias, the rope rotates 64 of
+/// 128 lanes half-rotated, the append and the attention are at head dim 128 (decode at one row,
+/// prefill at 128), and each tape validates.
+#[test]
+fn a_glm_attention_at_head_dim_128_lowers_with_its_biases() {
+    for (m, decode) in [(1, true), (128, false)] {
+        let c = lower_with(&glm_attn(m), GLM_ATTN_FACTS).unwrap_or_else(|e| panic!("m={m}: {e}"));
+        let biases: Vec<BiasAddBf16> = (c.steps.iter())
+            .filter_map(|s| match *s {
+                CudaStep::BiasAdd(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        let widths: Vec<(u32, u32, u32)> =
+            biases.iter().map(|b| (b.rows, b.cols, b.bias.0)).collect();
+        assert_eq!(
+            widths,
+            [(m, 12 * 128, 3), (m, 128, 5), (m, 128, 7)],
+            "m={m}: q, k and v, each its own bias"
+        );
+        let (mut ropes, mut appends, mut attns) = (0, 0, 0);
+        for s in &c.steps {
+            match *s {
+                CudaStep::Rope(r) => {
+                    ropes += 1;
+                    assert_eq!((r.head_dim, r.rot_dim), (128, 64), "m={m}");
+                    assert_eq!(
+                        r.pairing,
+                        scratchy_target_cuda::step::RopePairing::HalfRotated
+                    );
+                }
+                CudaStep::RopeAppend(r) => {
+                    appends += 1;
+                    assert_eq!((r.head_dim, r.rot_dim, r.cols), (128, 64, 128), "m={m}");
+                }
+                CudaStep::AttnDecode(a) if decode => {
+                    attns += 1;
+                    assert_eq!((a.q_heads, a.kv_heads, a.head_dim), (12, 1, 128), "m={m}");
+                }
+                CudaStep::AttnPrefill(a) if !decode => {
+                    attns += 1;
+                    assert_eq!((a.q_heads, a.kv_heads, a.head_dim), (12, 1, 128), "m={m}");
+                }
+                CudaStep::AttnDecode(_) | CudaStep::AttnPrefill(_) => {
+                    panic!("m={m}: the other attention kernel")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!((ropes, appends, attns), (1, 1, 1), "m={m}");
+        let kv = c.kv.as_ref().expect("the layer has a KV cache");
+        assert_eq!((kv.kv_heads, kv.head_dim), (1, 128), "m={m}");
+        let tape = static_tape(&c);
+        tape.validate().unwrap_or_else(|e| panic!("m={m}: {e}"));
+        // The bias is one `[cols]` bf16 row, as the tape declares it.
+        for b in &biases {
+            assert_eq!(tape.weight_bytes[b.bias.0 as usize], u64::from(b.cols) * 2);
+        }
+    }
+}
+
+/// A bias add whose bias is not one `[1, cols]` row is refused, naming its operand.
+#[test]
+fn a_bias_add_whose_bias_is_not_one_row_of_cols_is_refused() {
+    for b in [shape(2, 256), shape(1, 128)] {
+        let e = refused(&ew_only(EwKind::BiasAdd, 128, 256, Some(b)), &["BiasAdd"]);
+        assert!(
+            matches!(
+                e,
+                CanonicalRefusal::OperandShape {
+                    operand: 1,
+                    op: "BiasAdd",
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+    }
+}
+
+/// A bias add off the row rule (`cols` not a multiple of 8) is refused as a row shape.
+#[test]
+fn a_bias_add_off_the_vector_width_is_refused() {
+    let e = refused(
+        &ew_only(EwKind::BiasAdd, 128, 260, Some(shape(1, 260))),
+        &["BiasAdd"],
+    );
+    assert!(matches!(e, CanonicalRefusal::RowShape { .. }), "{e:?}");
+}
+
+/// A bias add over a whole `[1, cols]` bias lowers to one `BiasAdd` step reading it.
+#[test]
+fn a_bias_add_lowers_to_one_step() {
+    let c = lower_with(
+        &ew_only(EwKind::BiasAdd, 128, 256, Some(shape(1, 256))),
+        QWEN3_5_FACTS,
+    )
+    .expect("a bias add lowers");
+    let [CudaStep::BiasAdd(b)] = c.steps.as_slice() else {
+        panic!("{:?}", c.steps);
+    };
+    assert_eq!((b.rows, b.cols, b.bias), (128, 256, WeightIx(1)));
+    static_tape(&c)
+        .validate()
+        .expect("the bias-add tape validates");
+}
+
+/// GLM's MoE block lowers at one row (gathered) and at 512 (sorted): the routing is GLM's program,
+/// its correction bias the router's own bundle at `moe_bundle_biased`'s offset, renormalised; the
+/// experts are SiLU and read the dense bundle; the bundle is declared to the end of the bias.
+#[test]
+fn a_glm_moe_block_lowers_in_both_modes() {
+    use common::glm_moe::{EXPERTS, H, I};
+    let layout = moe_bundle_biased(EXPERTS, H, I).expect("the layout fits");
+    for m in [1, 512] {
+        let c = lower_with(&glm_moe(m), GLM_MOE_FACTS).unwrap_or_else(|e| panic!("m={m}: {e}"));
+        let (mut routes, mut silus, mut experts) = (0, 0, 0);
+        for step in &c.steps {
+            match *step {
+                CudaStep::RouterLogits(r) => {
+                    assert_eq!((r.weight, r.bundle), (MoeWeight::Bundle, WeightIx(1)));
+                }
+                CudaStep::MoeRoute(r) => {
+                    routes += 1;
+                    assert_eq!(
+                        r.program,
+                        RouteProgram::GlmSigmoidBias {
+                            bias: WeightIx(1),
+                            bias_offset: layout.bias,
+                        },
+                        "m={m}"
+                    );
+                    assert_eq!((r.renorm, r.expert_scale), (true, None), "m={m}");
+                }
+                CudaStep::SiluMul(_) => silus += 1,
+                CudaStep::ExpertGemv(g) => {
+                    experts += 1;
+                    assert_eq!(g.weight, MoeWeight::Bundle, "m={m}");
+                }
+                CudaStep::ExpertGemm(g) => {
+                    experts += 1;
+                    assert_eq!(g.weight, MoeWeight::Bundle, "m={m}");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!((routes, silus, experts), (1, 1, 3), "m={m}");
+        let tape = static_tape(&c);
+        assert_eq!(
+            tape.weight_bytes[1], layout.bytes,
+            "m={m}: the bundle to the bias's end"
+        );
+        tape.validate().unwrap_or_else(|e| panic!("m={m}: {e}"));
+    }
+}
+
+/// GLM's routing whose correction bias is another weight than its router's bundle is refused:
+/// the step reads the bias from that bundle.
+#[test]
+fn a_glm_routing_whose_bias_is_not_its_routers_bundle_is_refused() {
+    let mut l = glm_moe(512);
+    l.input.sources.push(shape(1, 1));
+    l.bindings.push(l.bindings[1].clone());
+    l.input.ops[1].inputs[1] = InputRef::Ext(2);
+    let e = refused_with(&l, GLM_MOE_FACTS, &["RouteTopK", "correction bias"]);
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::MoeShape {
+                rule: MoeShapeRule::Routing,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// The `MoeRoute` fold drives no routing whose pre is a sigmoid with a bias of another router
+/// bundle: Gemma's bundle has no correction bias.
+#[test]
+fn a_glm_routing_of_another_router_bundle_is_refused() {
+    let mut l = glm_moe(512);
+    l.input.ops[1].op = SubOp::RouteSigmoidBias {
+        router: scratchy_subtile::subtile_ir::RouterBundle::Gemma,
+    };
+    let e = refused_with(&l, GLM_MOE_FACTS, &["RouteTopK", "correction bias"]);
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::MoeShape {
+                rule: MoeShapeRule::Routing,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// A KV append at head dim 128 now lowers (#938), so the refusal at another head dim pins one the
+/// tables still lack: a `RopeAppend` whose head dim is not its class's is refused as `KvHeadDim`
+/// (128 against the class's 256).
+#[test]
+fn a_rope_append_at_128_against_a_256_class_is_refused() {
+    let l = attn_layer_with(
+        12,
+        rope_append_op(128, LAYER, AttnMask::Causal, RopeFormTag::NeoX),
+    );
+    let e = refused(&l, &["RopeAppend", "head_dim = 128", "256"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::KvHeadDim {
+            head_dim: 128,
+            want: 256,
+            ..
+        }
+    ));
+}
+
+/// An attention at head dim 128 passes the head-dim table (#938) and is refused as `KvHeadDim`
+/// when its layer's class is 256 wide.
+#[test]
+fn an_attention_at_128_against_a_256_class_is_refused() {
+    let e = refused(
+        &attn_only(256, geom(16, 4, 128)),
+        &["AttnDecode", "head_dim = 128", "256"],
+    );
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::KvHeadDim {
+                step: 0,
+                head_dim: 128,
+                want: 256,
+                ..
+            }
+        ),
+        "{e:?}"
     );
 }

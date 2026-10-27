@@ -4021,6 +4021,22 @@ mod tests {
         }
     }
 
+    /// A KV class of head dim 128 (GLM-4.5-Air's, #938) is one the kernels take, as 256 and 512
+    /// are: it validates.
+    #[test]
+    fn a_kv_class_at_head_dim_128_validates() {
+        let class = KvClass {
+            kv_heads: 4,
+            head_dim: 128,
+            window: None,
+        };
+        let kv = KvTape {
+            classes: Box::leak(Box::new([class])),
+            ..KV
+        };
+        assert_eq!(kv_tape(kv, &[]).validate(), Ok(()));
+    }
+
     /// A KV step's geometry is its layer's class: a class-1 layer's append and attention of one
     /// 512-lane head validate; the class-0 geometry on that layer, or a window its class lacks, is
     /// `KvStepGeometry`.
@@ -4212,6 +4228,108 @@ mod tests {
         assert_eq!(
             tape(None, &[norm(2304)]).validate(),
             Err(TapeError::MoeStepGeometry { step: 0 })
+        );
+    }
+
+    // ── GLM-4.5-Air's checks (#938) ─────────────────────────────────
+
+    /// A bias add over `GOOD`'s colours: `x [256, 1024]` colour 0, the bias weight 2, `out` colour
+    /// 2, `cols` 1024.
+    fn bias_add(bias: u32, cols: u32) -> CudaStep {
+        CudaStep::BiasAdd(crate::step::BiasAddBf16 {
+            x: ArenaOffset(0),
+            bias: WeightIx(bias),
+            out: ArenaOffset(786432),
+            rows: 256,
+            cols,
+        })
+    }
+
+    /// A bias add whose bias is declared one `[cols]` bf16 row validates; one declared as any other
+    /// size is `BiasShape`, naming both sizes.
+    #[test]
+    fn a_bias_add_reads_one_row_of_bias() {
+        let one_row: &'static [u64] = &[0, 1048576, 1024];
+        let t = |weights: &'static [u64]| CudaTape {
+            arena: ArenaLayout {
+                colour_bytes: &[262144, 524288, 262144],
+                ..GOOD.arena
+            },
+            result: span(786432, 262144),
+            weight_bytes: weights,
+            ..with_step(bias_add(2, 512))
+        };
+        assert_eq!(t(one_row).validate(), Ok(()));
+        assert_eq!(
+            t(&[0, 1048576, 2048]).validate(),
+            Err(TapeError::BiasShape {
+                step: 0,
+                ix: 2,
+                declared: 2048,
+                want: 1024,
+            })
+        );
+    }
+
+    /// GLM's routing over [`MOE`]: its correction bias at `moe_bundle_biased`'s offset for the
+    /// tape's MoE geometry validates; at any other offset it is `RouteBiasOffset`, naming both.
+    #[test]
+    fn a_glm_routing_reads_its_bias_at_the_bundles_offset() {
+        let layout = crate::step::moe_bundle_biased(MOE.experts, MOE.hidden, MOE.inter)
+            .expect("the layout fits");
+        let route = |bias_offset| {
+            CudaStep::MoeRoute(MoeRouteBf16 {
+                program: RouteProgram::GlmSigmoidBias {
+                    bias: WeightIx(0),
+                    bias_offset,
+                },
+                ..MOE_ROUTE
+            })
+        };
+        let t = |offset| CudaTape {
+            weight_bytes: Box::leak(Box::new([layout.bytes])),
+            ..moe_tape(Some(MOE), &[route(offset)])
+        };
+        assert_eq!(t(layout.bias).validate(), Ok(()));
+        for off in [0, layout.bias - 256, layout.bias + 256] {
+            assert_eq!(
+                t(off).validate(),
+                Err(TapeError::RouteBiasOffset {
+                    step: 0,
+                    offset: off,
+                    want: Some(layout.bias),
+                }),
+                "offset {off}"
+            );
+        }
+        // The routing reads its bundle to the bias's end: a bundle declared short of it is short.
+        let short = CudaTape {
+            weight_bytes: Box::leak(Box::new([layout.bias])),
+            ..moe_tape(Some(MOE), &[route(layout.bias)])
+        };
+        assert_eq!(
+            short.validate(),
+            Err(TapeError::WeightShort {
+                step: 0,
+                ix: 0,
+                need: layout.bytes,
+                declared: layout.bias,
+            })
+        );
+    }
+
+    /// The biased bundle: the dense bundle, then the f32 bias at the next multiple of 256.
+    #[test]
+    fn the_biased_bundle_appends_the_bias_aligned() {
+        let b = crate::step::moe_bundle_biased(4, 64, 32).expect("fits");
+        let dense = crate::step::moe_bundle(4, 64, 32).expect("fits");
+        assert_eq!(b.experts, dense);
+        assert_eq!(dense.bytes, (4 * 64 + 4 * 2 * 32 * 64 + 4 * 64 * 32) * 2);
+        assert_eq!(b.bias, dense.bytes.next_multiple_of(CUDA_ARENA_ALIGN));
+        assert_eq!(b.bytes, b.bias + 4 * 4);
+        assert_eq!(
+            crate::step::moe_bundle_biased(u32::MAX, u32::MAX, u32::MAX),
+            None
         );
     }
 }

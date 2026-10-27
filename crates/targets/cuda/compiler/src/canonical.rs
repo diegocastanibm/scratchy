@@ -1029,7 +1029,8 @@ impl std::fmt::Display for MoeShapeRule {
             Self::Activation => write!(f, "its gated activation is neither SiLU nor GELU"),
             Self::Routing => write!(
                 f,
-                "its routing is not a softmax, then the top-k, then an optional renorm"
+                "its routing is not a softmax, then the top-k, then an optional renorm (or GLM's \
+                 sigmoid plus its router bundle's correction bias in place of the softmax)"
             ),
             Self::Geometry => write!(
                 f,
