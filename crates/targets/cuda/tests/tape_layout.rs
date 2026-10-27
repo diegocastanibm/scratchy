@@ -3099,3 +3099,33 @@ fn an_attention_at_128_against_a_256_class_is_refused() {
         "{e:?}"
     );
 }
+
+/// The tapes `tape_player`'s three GLM `NotLaunched` tests play validate, with no GPU: the
+/// one-row attention prelude and MoE block, and the prelude with no biases, whose first step with
+/// no kernel is its head-dim-128 append (a GEMV and the 128-lane rope before it launch).
+#[test]
+fn the_glm_not_launched_tapes_validate() {
+    use common::glm_moe::glm_attn_unbiased;
+    for (what, l, facts) in [
+        ("prelude", glm_attn(1), GLM_ATTN_FACTS),
+        ("MoE block", glm_moe(1), GLM_MOE_FACTS),
+        ("unbiased prelude", glm_attn_unbiased(1), GLM_ATTN_FACTS),
+    ] {
+        let tape = static_tape(&lower_with(&l, facts).unwrap_or_else(|e| panic!("{what}: {e}")));
+        tape.validate().unwrap_or_else(|e| panic!("{what}: {e}"));
+        if what == "unbiased prelude" {
+            assert!(!tape.steps.iter().any(|s| matches!(s, CudaStep::BiasAdd(_))));
+            let first = tape.steps.iter().position(|s| {
+                matches!(
+                    s,
+                    CudaStep::RopeAppend(_) | CudaStep::AttnDecode(_) | CudaStep::BiasAdd(_)
+                )
+            });
+            assert!(
+                matches!(first.map(|i| tape.steps[i]), Some(CudaStep::RopeAppend(r)) if r.head_dim == 128),
+                "{what}: {:?}",
+                tape.steps
+            );
+        }
+    }
+}

@@ -19,6 +19,7 @@ pub mod common {
     pub mod gemma_moe;
     pub mod gemma_moe_block;
     pub mod gemma_rows;
+    pub mod glm_moe;
     pub mod mlp;
     pub mod moe_block;
     pub mod numerics;
@@ -4560,5 +4561,91 @@ fn gemma_attn_two_classes_share_the_pool() {
     assert!(
         pass,
         "the two-class chain is out of bound, or the classes overlap in the pool"
+    );
+}
+
+// ── GLM-4.5-Air's steps are refused up front (#938's 14a) ──────────
+
+use common::glm_moe::{GLM_ATTN_FACTS, GLM_MOE_FACTS, glm_attn, glm_moe};
+
+/// `l` lowered at its `m` under `facts`, as one static tape.
+fn glm_tape(
+    l: &scratchy_subtile::handoff::LoweredDecode,
+    facts: scratchy_target_cuda_compiler::canonical::CudaModelFacts,
+) -> CudaTape {
+    let m = l.input.ops[0].m;
+    let at = CanonicalAt {
+        stem: "glm",
+        m: u64::from(m),
+    };
+    let c = lower_canonical(l, facts, at).unwrap_or_else(|e| panic!("the GLM chain lowers: {e}"));
+    static_tape(&c)
+}
+
+/// A worker over `tape` alone, every weight a zero buffer of its declared size, a KV pool when the
+/// tape has a KV cache; then one forward of zero input, which must be refused with `NotLaunched` at
+/// the first step `is` names, op `op`, with the result colour and the host result untouched.
+fn assert_not_launched(tape: CudaTape, is: fn(&CudaStep) -> bool, op: &str) {
+    let device = h100();
+    let step = (tape.steps.iter())
+        .position(is)
+        .expect("the tape holds the step");
+    let table: Vec<DeviceBuffer> = (tape.weight_bytes.iter())
+        .map(|&b| match b {
+            0 => DeviceBuffer::empty(),
+            b => DeviceBuffer::upload_bytes(&device, &vec![0u8; b as usize]).expect("upload"),
+        })
+        .collect();
+    let table: &'static [DeviceBuffer] = Box::leak(table.into_boxed_slice());
+    let tapes: &'static [CudaTape] = Box::leak(Box::new([tape]));
+    let pool = tape.kv.map(|_| KvPoolConfig { num_blocks: 4 });
+    let mut worker = CudaWorker::new(&device, tapes, table, pool, None).expect("worker");
+    let x = vec![0u16; tape.input.span().bytes as usize / 2];
+    let result = tape.result;
+    let mut y = vec![0xBEEFu16; result.bytes as usize / 2];
+    let before = read(&mut worker, result);
+    let e = worker
+        .forward(0, Input::Hidden(&x), &[], None, None, &mut y)
+        .expect_err("a step with no kernel is not launched");
+    eprintln!("glm {op}, step {step}: {e}");
+    assert!(
+        matches!(e, ForwardError::NotLaunched { step: s, op: o } if s == step && o == op),
+        "{e:?}"
+    );
+    assert!(y.iter().all(|&v| v == 0xBEEF), "the result is untouched");
+    assert_eq!(read(&mut worker, result), before, "nothing was enqueued");
+}
+
+/// GLM's attention prelude at one row is refused at its first `BiasAdd` (the q bias, after the
+/// norm and the q GEMV), before anything is uploaded or enqueued: the bias add has no kernel yet.
+#[test]
+fn a_glm_bias_add_is_not_launched() {
+    assert_not_launched(
+        glm_tape(&glm_attn(1), GLM_ATTN_FACTS),
+        |s| matches!(s, CudaStep::BiasAdd(_)),
+        "BiasAdd",
+    );
+}
+
+/// GLM's MoE block at one row is refused at its `MoeRoute` (GLM's sigmoid-and-bias program), the
+/// router GEMV before it notwithstanding: the routing has no kernel yet.
+#[test]
+fn a_glm_routing_is_not_launched() {
+    assert_not_launched(
+        glm_tape(&glm_moe(1), GLM_MOE_FACTS),
+        |s| matches!(s, CudaStep::MoeRoute(_)),
+        "MoeRoute",
+    );
+}
+
+/// GLM's attention prelude at one row with no biases (`glm_attn_unbiased`) is refused at its
+/// head-dim-128 `RopeAppend`, after the norm, the GEMVs and the 128-lane rope: the KV append at
+/// 128 has no kernel yet.
+#[test]
+fn a_glm_append_at_head_dim_128_is_not_launched() {
+    assert_not_launched(
+        glm_tape(&common::glm_moe::glm_attn_unbiased(1), GLM_ATTN_FACTS),
+        |s| matches!(s, CudaStep::RopeAppend(r) if r.head_dim == 128),
+        "RopeAppend",
     );
 }

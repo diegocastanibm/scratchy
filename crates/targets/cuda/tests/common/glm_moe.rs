@@ -263,3 +263,26 @@ pub fn glm_attn(m: u32) -> LoweredDecode {
     l.bindings[11] = SourceBinding::PrefixV { layer: 0 };
     l
 }
+
+/// [`glm_attn`] with no q, k and v biases: the same head-dim-128 prelude, its first step with no
+/// kernel the `RopeAppend` at 128. Each `BiasAdd` is dropped and its reader reads the projection
+/// itself (ops 2, 4 and 6 removed, the later ops renumbered).
+pub fn glm_attn_unbiased(m: u32) -> LoweredDecode {
+    use InputRef::{Ext, Op};
+    let mut input = glm_attn_input(m);
+    // Ops 0 n, 1 q, 3 k, 5 v, 7 rope, 8 append, 9 attention, with the bias adds dropped; their
+    // readers now read the projections: q 1, k 2, v 3 in the new numbering.
+    let keep = [0usize, 1, 3, 5, 7, 8, 9];
+    let mut ops: Vec<OpDesc> = keep.iter().map(|&i| input.ops[i].clone()).collect();
+    ops[4].inputs = vec![Op(1), Ext(8), Ext(9)];
+    ops[5].inputs = vec![Op(2), Ext(8), Ext(9), Op(3), Ext(10), Ext(11)];
+    ops[6].inputs = vec![Op(4), Ext(10), Ext(11), Op(5), Op(3)];
+    input.ops = ops;
+    input.result = 6;
+    let mut l = with_hidden(input);
+    l.bindings[8] = SourceBinding::Cos { local: false };
+    l.bindings[9] = SourceBinding::Sin { local: false };
+    l.bindings[10] = SourceBinding::PrefixK { layer: 0 };
+    l.bindings[11] = SourceBinding::PrefixV { layer: 0 };
+    l
+}
