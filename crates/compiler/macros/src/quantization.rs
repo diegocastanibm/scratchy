@@ -3076,4 +3076,123 @@ mod tests {
         assert!(!ggml.same_storage_format(&affine));
         assert!(!affine.same_storage_format(&ggml));
     }
+
+    // ── GLM-4.5-Air's MLX 4-bit g64 checkpoint and its dense router (#947) ──
+
+    /// GLM's section as the b4-g64-qembed preset and the checkpoint's overrides merge it:
+    /// `{bits: 4, group_size: 64, quant_embed: true}` with `modules_to_not_convert:
+    /// ["mlp.gate"]`. The `glm4-moe` DSL names the MoE bundle `moe`; on disk it is `mlp`.
+    const GLM_B4: &str = r#"{
+        "quantization_config": {
+            "bits": 4, "group_size": 64, "quant_embed": true,
+            "modules_to_not_convert": ["mlp.gate"]
+        }
+    }"#;
+
+    fn glm_program() -> Program {
+        let mut program = Program::default();
+        program.weight_leaf_renames = vec![
+            ("moe".to_string(), "mlp".to_string()),
+            (
+                "mlp.shared_expert".to_string(),
+                "mlp.shared_experts".to_string(),
+            ),
+        ];
+        program
+    }
+
+    /// The MLX-affine parser reads `modules_to_not_convert` as the section's dense roles, not as
+    /// a per-module entry (an array, which it used to refuse as `quantization.<module>`), and
+    /// refuses a list that is not of strings.
+    #[test]
+    fn the_affine_parser_reads_modules_to_not_convert() {
+        let method = method_of(GLM_B4);
+        let QuantMethod::Affine {
+            bits,
+            group_size,
+            quantize_embed,
+            ref per_module,
+            ref dense_roles,
+            ..
+        } = method
+        else {
+            panic!("expected Affine, got {method:?}");
+        };
+        assert_eq!((bits, group_size, quantize_embed), (4, 64, true));
+        assert!(per_module.is_empty(), "{per_module:?}");
+        assert_eq!(dense_roles, &["mlp.gate".to_string()]);
+        let qc = QuantizationConfig::parse(&json(GLM_B4)).unwrap().unwrap();
+        assert_eq!(qc.modules_to_not_convert, ["mlp.gate".to_string()]);
+        let bad =
+            r#"{"quantization": {"bits": 4, "group_size": 64, "modules_to_not_convert": [1]}}"#;
+        assert!(matches!(
+            QuantizationConfig::parse(&json(bad)),
+            Err(ParseError::BadField {
+                field: "modules_to_not_convert",
+                ..
+            })
+        ));
+    }
+
+    /// The router `modules_to_not_convert` names is dense at every layer, through the full
+    /// safetensors path the MoE codegen asks by (`model.layers.N.mlp.gate`) and the DSL role
+    /// alike; every other role (layer 0's dense MLP, the shared expert, attention) is 4-bit; the
+    /// routed experts are 4/4/4. The match is exact: `mlp.gate_proj` is not `mlp.gate`.
+    #[test]
+    fn glm_b4s_router_is_dense_and_every_other_role_4_bit() {
+        use scratchy_subtile::subtile_ir::{ExpertBody, GatedAct};
+        let (method, program) = (method_of(GLM_B4), glm_program());
+        for layer in [1, 45] {
+            let at =
+                |role: &str| affine_role_bits(&program, &method, role, Some(UnrollIndex(layer)));
+            assert_eq!(
+                at(&format!("model.layers.{layer}.mlp.gate")),
+                None,
+                "layer {layer}"
+            );
+            assert_eq!(at("moe.gate"), None, "layer {layer}: the DSL role");
+            for role in [
+                "mlp.gate_proj",
+                "mlp.up_proj",
+                "mlp.down_proj",
+                "mlp.shared_expert.gate_proj",
+                "mlp.shared_expert.up_proj",
+                "mlp.shared_expert.down_proj",
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+            ] {
+                assert_eq!(at(role), Some(4), "layer {layer} {role}");
+            }
+            assert_eq!(
+                affine_moe_expert_bits(
+                    &program,
+                    &method,
+                    &format!("model.layers.{layer}.mlp"),
+                    Some(UnrollIndex(layer)),
+                    ExpertBody::Gated(GatedAct::Silu),
+                ),
+                Some(ExpertBits::Gated {
+                    gate: 4,
+                    up: 4,
+                    down: 4
+                }),
+                "layer {layer}"
+            );
+        }
+        // Without the list the router resolves at the section default, as before.
+        let plain = method_of(
+            r#"{"quantization_config": {"bits": 4, "group_size": 64, "quant_embed": true}}"#,
+        );
+        assert_eq!(
+            affine_role_bits(
+                &program,
+                &plain,
+                "model.layers.1.mlp.gate",
+                Some(UnrollIndex(1))
+            ),
+            Some(4)
+        );
+    }
 }

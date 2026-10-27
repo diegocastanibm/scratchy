@@ -16790,6 +16790,112 @@ mod fingerprint_tests {
         (program, fuf)
     }
 
+    /// [`fuf_of`] for the target-emitter seam: the program, its FUF and its inferred shapes.
+    #[cfg(feature = "target-emitter")]
+    fn seam_front_end(
+        arch: &str,
+        model: &crate::config::ModelParams,
+    ) -> (Program, Fuf, crate::shape::Inferred) {
+        let dsl = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/arch/dsl")
+            .join(format!("{arch}.py"));
+        let carrier =
+            crate::parse_python::parse_python_file(&std::fs::read_to_string(dsl).unwrap())
+                .expect("carrier parses");
+        let mut program =
+            crate::classify::classify_with(&carrier.ast, crate::classified::Prelude::Decoder)
+                .expect("classify");
+        program.weight_leaf_renames = model.arch.weight_leaf_renames.clone();
+        let manifest =
+            crate::weights_manifest::load_or_empty(&arch_configs(arch)).expect("manifest");
+        let inferred = match crate::shape::infer(&program, &manifest, &model.bounds) {
+            Ok(inf) => inf,
+            Err(crate::shape::ShapeError::ReshapeRecovery { hints }) => {
+                crate::shape::apply_reshape_hints(&mut program, &hints);
+                crate::shape::infer(&program, &manifest, &model.bounds).expect("shapes 2")
+            }
+            Err(e) => panic!("shapes: {e}"),
+        };
+        let cfg = crate::cfg::build_cfg(&program, model).expect("cfg");
+        let mut fuf = crate::fuf::unroll(&cfg, &inferred).expect("unroll");
+        fuf.annotate_storage_formats(&program, model);
+        (program, fuf, inferred)
+    }
+
+    /// GLM-4.5-Air's 4-bit variant across the target-emitter seam (#947, criterion 3), at one
+    /// prefill workload point: the embedding table is affine 4-bit g64; each of the 45 MoE
+    /// bundles is `{64, router dense, [4, 4, 4]}`, the plan `moe_affine_plan` gives metal's
+    /// loader; each names its 11 tensors as the checkpoint's header lists them; and a dense
+    /// model (qwen3.6-35b-a3b, no preset) hands none of it across.
+    #[test]
+    #[cfg(feature = "target-emitter")]
+    fn glm_b4s_affine_facts_cross_the_target_seam() {
+        use scratchy_subtile::handoff::{AffineBundleTensor as T, TargetAffine, TargetMoeAffine};
+        let points = crate::workload::WorkloadPoints::grid(&[512], &[128]);
+        let glm = variant_of("glm4-moe", "glm-4.5-air", "mlx-affine-b4-g64-qembed");
+        let (program, fuf, inferred) = seam_front_end("glm4-moe", &glm);
+        let input = target_model_input(&program, &glm, &fuf, &inferred, &points, 1);
+        assert_eq!(
+            input.facts.embed_affine,
+            Some(TargetAffine {
+                group_size: 64,
+                bits: 4
+            })
+        );
+        let layers: Vec<u64> = (input.moe_affine.iter())
+            .map(|(_, index, _)| index.expect("a per-layer bundle").0)
+            .collect();
+        assert_eq!(layers, (1..46).collect::<Vec<u64>>(), "the 45 MoE layers");
+        for (_, _, plan) in &input.moe_affine {
+            assert_eq!(
+                *plan,
+                TargetMoeAffine {
+                    group_size: 64,
+                    router: None,
+                    experts: [Some(4), Some(4), Some(4)],
+                }
+            );
+        }
+        assert_eq!(input.affine_bundle_names.len(), 45 * 11);
+        assert!(
+            input.unlowered.is_empty() && input.buckets.len() == 1,
+            "the variant lowers at m=512: {:?}",
+            input.unlowered
+        );
+        let leaves = [
+            (T::Router, "gate.weight"),
+            (T::CorrectionBias, "gate.e_score_correction_bias"),
+            (T::GateW, "switch_mlp.gate_proj.weight"),
+            (T::GateScales, "switch_mlp.gate_proj.scales"),
+            (T::GateBiases, "switch_mlp.gate_proj.biases"),
+            (T::UpW, "switch_mlp.up_proj.weight"),
+            (T::UpScales, "switch_mlp.up_proj.scales"),
+            (T::UpBiases, "switch_mlp.up_proj.biases"),
+            (T::DownW, "switch_mlp.down_proj.weight"),
+            (T::DownScales, "switch_mlp.down_proj.scales"),
+            (T::DownBiases, "switch_mlp.down_proj.biases"),
+        ];
+        for (id, index, _) in &input.moe_affine {
+            let layer = index.expect("a per-layer bundle").0;
+            let names: Vec<(T, &str)> = (input.affine_bundle_names.iter())
+                .filter(|(i, x, ..)| (i, x) == (id, index))
+                .map(|(_, _, t, n)| (*t, n.as_str()))
+                .collect();
+            let want: Vec<(T, String)> = (leaves.iter())
+                .map(|&(t, leaf)| (t, format!("model.layers.{layer}.mlp.{leaf}")))
+                .collect();
+            let want: Vec<(T, &str)> = want.iter().map(|(t, n)| (*t, n.as_str())).collect();
+            assert_eq!(names, want, "layer {layer}");
+        }
+        // A dense model hands no affine fact across.
+        let qwen = config_of("qwen3-5-moe", "qwen3.6-35b-a3b");
+        let (program, fuf, inferred) = seam_front_end("qwen3-5-moe", &qwen);
+        let dense = target_model_input(&program, &qwen, &fuf, &inferred, &points, 1);
+        assert_eq!(dense.facts.embed_affine, None);
+        assert!(dense.moe_affine.is_empty(), "{:?}", dense.moe_affine);
+        assert!(dense.affine_bundle_names.is_empty());
+    }
+
     /// ⛔ THE REGRESSION THIS GATE EXISTS FOR: the emu's ONE baked prefill width
     /// is DERIVED per model (`emu_prefill_lx_width`) from its own fp8 gemms —
     /// `3·m·N·2 + N·2` bytes of intra-node epilogue tiles vs 7/8 of a core's

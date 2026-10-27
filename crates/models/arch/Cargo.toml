@@ -812,6 +812,12 @@ required-features = ["metal"]
 name = "cuda_tapes"
 required-features = ["cuda", "qwen3.5-0.8b"]
 
+# GLM-4.5-Air's two MLX variants' affine bit maps, each against both checkpoints' header-only
+# fixtures (#947). Reads the metal emission; no weights.
+[[test]]
+name = "glm4_moe_affine_fingerprint"
+required-features = ["metal", "glm-4.5-air"]
+
 # One whole-model prefill forward of qwen3.5-0.8b's emitted tapes on the GPU, synthetic weights.
 # Needs nvcc to build and an H100 to run.
 [[test]]
