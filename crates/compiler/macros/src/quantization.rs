@@ -3090,15 +3090,16 @@ mod tests {
     }"#;
 
     fn glm_program() -> Program {
-        let mut program = Program::default();
-        program.weight_leaf_renames = vec![
-            ("moe".to_string(), "mlp".to_string()),
-            (
-                "mlp.shared_expert".to_string(),
-                "mlp.shared_experts".to_string(),
-            ),
-        ];
-        program
+        Program {
+            weight_leaf_renames: vec![
+                ("moe".to_string(), "mlp".to_string()),
+                (
+                    "mlp.shared_expert".to_string(),
+                    "mlp.shared_experts".to_string(),
+                ),
+            ],
+            ..Program::default()
+        }
     }
 
     /// The MLX-affine parser reads `modules_to_not_convert` as the section's dense roles, not as
