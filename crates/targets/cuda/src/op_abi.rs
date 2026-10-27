@@ -95,7 +95,6 @@ pub fn cuda_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRule
         | L::GatedDeltaNet
         | L::Mamba2 { .. }
         | L::Mean
-        | L::RouteSigmoidBias { .. }
         | L::RouteBias { .. }
         | L::ExpertAct { .. }
         | L::ExpertCombine { .. }
@@ -114,6 +113,7 @@ pub fn cuda_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRule
         | L::RouteExpertScale { .. }
         | L::RouterLogits { .. }
         | L::RouteSoftmax
+        | L::RouteSigmoidBias { .. }
         | L::RouteArgsort
         | L::RouteTopK { .. }
         | L::RouteGatherScores
@@ -144,17 +144,18 @@ pub enum CudaFusion {
     /// gates, and Gemma's expert activation. Its kernel is #885's 13b.
     GeluMul,
     /// A MoE block's routing in one launch (`kernels/moe_route_bf16.cu`): the softmax over the
-    /// router's logits (Qwen) or none (Gemma) and their argsort folded into the top-k; the
+    /// router's logits (Qwen), their sigmoid plus the correction bias (GLM; its kernel is #938's
+    /// 14b) or none (Gemma) and their argsort folded into the top-k; the
     /// gathered scores, their scale, softmax or renorm, and the per-expert scale its epilogues.
     MoeRoute,
 }
 
 /// CUDA's fusions, in the order the shared fold pass applies them: one sweep of two patterns. The
 /// `Silu` or `Gelu` a `Mul` reads as its operand 0 folds into that `Mul` (metal's `Gated` row).
-/// A MoE block's top-k folds in the softmax (Qwen's softmax-first routing) and the argsort before
-/// it, and takes as its epilogues the gathered scores, Gemma's `hidden^-0.5` scale (tail stage 0),
+/// A MoE block's top-k folds in the softmax (Qwen's softmax-first routing) or GLM's sigmoid plus
+/// correction bias, and the argsort before it, and takes as its epilogues the gathered scores, Gemma's `hidden^-0.5` scale (tail stage 0),
 /// a softmax over the picks (Gemma) or their renorm (Qwen) (stage 1), and Gemma's per-expert scale
-/// (stage 2): metal's `Route` row, without its sigmoid and bias routings and its last scale.
+/// (stage 2): metal's `Route` row, without its bias-only routing and its last scale.
 ///
 /// `fused` repeats `split`: CUDA's `ModelFoldFacts` never sets `fold_projections`, so the shared
 /// pass always picks `split`, and the gate and up GEMMs stay launches of their own. A `Gated` fold
@@ -181,7 +182,7 @@ pub const CUDA_FUSIONS: FusionTable<CudaFusion> = FusionTable {
         FoldPattern::Route {
             top_k: SubOpKind::RouteTopK,
             sort: SubOpKind::RouteArgsort,
-            pre: &[SubOpKind::RouteSoftmax],
+            pre: &[SubOpKind::RouteSoftmax, SubOpKind::RouteSigmoidBias],
             gather: SubOpKind::RouteGatherScores,
             tail: &[
                 &[SubOpKind::RouteScale],
@@ -231,15 +232,15 @@ pub enum CudaMoeWrite {
     /// In its operand's region: rewritten there in place (the renorm, over the scores), or read
     /// through it (the unsort, which the combine reads through the sort's `pos`).
     OverOperand(OperandIx),
-    /// Nowhere: a member of the `MoeRoute` fold (the softmax, the argsort) its launch keeps in
-    /// registers. No other step reads it.
+    /// Nowhere: a member of the `MoeRoute` fold (the softmax or GLM's sigmoid and bias, the
+    /// argsort) its launch keeps in registers. No other step reads it.
     InFold,
     /// In the arena: the combine's `[m, hidden]` result.
     Arena,
 }
 
 /// CUDA's MoE dataflow: where each op of a block's value is. `None` for an op CUDA lowers no MoE
-/// step for (the sigmoid and bias routings, the ungated expert) or that only rides the
+/// step for (the bias-only routing, the ungated expert) or that only rides the
 /// `MoeRoute` fold as an epilogue (the scales).
 pub fn cuda_moe_write<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> Option<CudaMoeWrite> {
     use CudaMoeRegion as R;
@@ -248,7 +249,7 @@ pub fn cuda_moe_write<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> Option<CudaM
     Some(match op {
         L::RouterNorm { .. } => W::Region(R::RouterNorm),
         L::RouterLogits { .. } => W::Region(R::Logits),
-        L::RouteSoftmax | L::RouteArgsort => W::InFold,
+        L::RouteSoftmax | L::RouteSigmoidBias { .. } | L::RouteArgsort => W::InFold,
         L::RouteTopK { .. } => W::Region(R::TopKIdx),
         L::RouteGatherScores => W::Region(R::Scores),
         L::RouteRenorm | L::ExpertUnsort => W::OverOperand(OperandIx(0)),
@@ -296,9 +297,10 @@ const _: () = assert!(CUDA_EXPERT_TILE_ROWS == crate::step::GEMM_BF16_TILE.0);
 
 /// The archs whose tapes CUDA lowers with the 64-column GEMM tile (`step::GEMM_COL64_TILE`):
 /// Gemma 4 26B-A4B, whose router (128), expert (704) and dense MLP (2112) widths are multiples of
-/// 64 and not of 256. Every other arch's GEMMs take the 256-column tile only, so their rules and
-/// refusals are the tiled GEMM's.
-pub const CUDA_GEMM_COL64_ARCHS: &[&str] = &["gemma4-moe"];
+/// 64 and not of 256, and GLM-4.5-Air, whose router (128), expert and shared-expert (1408) and
+/// dense MLP (10944) widths are too. Every other arch's GEMMs take the 256-column tile only, so
+/// their rules and refusals are the tiled GEMM's.
+pub const CUDA_GEMM_COL64_ARCHS: &[&str] = &["gemma4-moe", "glm4-moe"];
 
 /// How many columns one graph node covers: all of them. Tiling is a target fact; spyre tiles to
 /// 128-column pages because its substrate requires it, while CUDA's kernels — like metal's — take
@@ -316,7 +318,8 @@ mod tests {
 
     /// The tables declare exactly CUDA's fused kernels, `SiluMul`, `GeluMul` and `MoeRoute`, and no
     /// sliced `lm_head`: any other pattern, or a sampled weight, would ask the shared passes for a
-    /// kernel CUDA does not have. The routing fold takes the softmax as its one pre (Qwen), and as
+    /// kernel CUDA does not have. The routing fold takes the softmax (Qwen) or the sigmoid plus
+    /// correction bias (GLM) as its pre, and as
     /// its tail Gemma's scale (stage 0), a softmax or a renorm (stage 1) and Gemma's per-expert
     /// scale (stage 2), nothing at stage 3.
     #[test]
@@ -359,7 +362,7 @@ mod tests {
                 SubOpKind::RouteGatherScores
             )
         );
-        assert_eq!(*pre, [SubOpKind::RouteSoftmax]);
+        assert_eq!(*pre, [SubOpKind::RouteSoftmax, SubOpKind::RouteSigmoidBias]);
         assert_eq!(
             **tail,
             [
@@ -372,10 +375,10 @@ mod tests {
         assert_eq!(*kernel, CudaFusion::MoeRoute);
     }
 
-    /// The 64-column GEMM is Gemma 4's alone.
+    /// The 64-column GEMM is Gemma 4's and GLM-4.5-Air's.
     #[test]
     fn the_64_column_gemm_archs() {
-        assert_eq!(CUDA_GEMM_COL64_ARCHS, ["gemma4-moe"]);
+        assert_eq!(CUDA_GEMM_COL64_ARCHS, ["gemma4-moe", "glm4-moe"]);
     }
 
     /// The MoE facts: two dense bundles with a grouped GEMM, at 128 or 256 experts, sorted from
@@ -471,6 +474,10 @@ mod tests {
         for (op, want) in gemma_cases {
             assert_eq!(cuda_moe_write(&op), want, "{}", op.name());
         }
+        let glm: SubOp = SubOp::RouteSigmoidBias {
+            router: RouterBundle::SharedFused,
+        };
+        assert_eq!(cuda_moe_write(&glm), Some(W::InFold), "{}", glm.name());
     }
 
     /// The rule's result for each op the CUDA tapes hold, or the next issues will, field by field.
@@ -608,6 +615,16 @@ mod tests {
             ),
             (SubOp::RouteScale { scale: 0.0188 }, off_arena),
             (SubOp::RouteExpertScale { router: gemma }, off_arena),
+            (
+                SubOp::RouteSigmoidBias {
+                    router: scratchy_subtile::subtile_ir::RouterBundle::SharedFused,
+                },
+                off_arena,
+            ),
+            (
+                SubOp::Elementwise(EwKind::BiasAdd),
+                fresh_across(Outputs::One),
+            ),
         ]);
         for (op, want) in cases {
             let got = cuda_colour_rule(&op);

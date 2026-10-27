@@ -8,7 +8,7 @@ pub use scratchy_subtile::handoff::RopePairing;
 pub use scratchy_subtile::subtile_ir::GainConvention;
 use serde::Serialize;
 
-use crate::tape::{ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, WeightIx};
+use crate::tape::{ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, WeightIx};
 
 /// One launch-emitting step of a lowered tape, its operands already resolved: one kernel launch,
 /// or two stream-ordered launches (a `RopeAppend` rotates K, then writes the cache).
@@ -112,6 +112,24 @@ pub enum CudaStep {
     /// [`GEMM_NARROW_BF16_MAX_N`]: the operands of [`Self::Gemm`], `kernels/gemm_bf16.cu`'s
     /// template at one 64-column B block (`scratchy_cuda_gemm_col64_bf16_abt`, #924).
     GemmCol64(GemmBf16),
+    /// `x + bias`, the bias broadcast over the rows (GLM's q, k and v biases), lowered from
+    /// `Elementwise(BiasAdd)`. Its kernel is #938's 14b: the worker refuses it until then.
+    BiasAdd(BiasAddBf16),
+}
+
+/// The bias add's `cols` is a non-zero multiple of this (one 16-byte vector of 8 bf16), `rows`
+/// non-zero, and `rows · cols` at most `i32::MAX`.
+pub const BIAS_ADD_BF16_COLS: u32 = 8;
+
+/// `out[r, c] = x[r, c] + bias[c]` over `[rows, cols]`, `bias` a `[cols]` bf16 weight, bf16 in and
+/// out, computed in f32 and rounded once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct BiasAddBf16 {
+    pub x: ArenaOffset,
+    pub bias: WeightIx,
+    pub out: ArenaOffset,
+    pub rows: u32,
+    pub cols: u32,
 }
 
 /// The 64-column GEMM's tile `(m, n, k)`: `gemm_bf16.cu`'s template at one 64-column B tile.
@@ -125,9 +143,10 @@ pub const GEMM_COL64_TILE: (u32, u32, u32) = (128, 64, 64);
 /// template at four or one 64-column B blocks.
 pub const EXPERT_GEMM_N_TILES: &[u32] = &[64, 256];
 
-/// The head dims the attention, rope-append and KV-append kernels take: 256 (every Qwen layer,
-/// Gemma's sliding layers) and 512 (Gemma's global layers, #885's 13c).
-pub const ATTN_BF16_HEAD_DIMS: &[u32] = &[256, 512];
+/// The head dims the attention, rope-append and KV-append kernels take: 128 (every GLM-4.5-Air
+/// layer, #938's 14b), 256 (every Qwen layer, Gemma's sliding layers) and 512 (Gemma's global
+/// layers, #885's 13c).
+pub const ATTN_BF16_HEAD_DIMS: &[u32] = &[128, 256, 512];
 
 /// A sliding window is a non-zero multiple of this many keys, [`CUDA_KV_BLOCK_SIZE`]: a KV tile
 /// is then wholly inside or wholly below the window but at the window's lower edge. Gemma's 1024
@@ -434,13 +453,17 @@ pub const ATTN_PREFILL_BF16_HEAD_DIM: u32 = 256;
 /// warpgroups keeps one 256-column half of the output; the prefill takes [`ATTN_PREFILL_BF16_ROWS`]
 /// and the decode [`ATTN_DECODE_BF16_MAX_GROUP`] as the head-dim-256 kernels do.
 pub const ATTN_D512_BF16_HEAD_DIM: u32 = 512;
+/// GLM-4.5-Air's head dim. No attention or KV-append kernel takes it yet (#938's 14b): the worker
+/// refuses a step at it with `ForwardError::NotLaunched`.
+pub const ATTN_D128_BF16_HEAD_DIM: u32 = 128;
 // The worker picks the attention kernel by these names: they are exactly the head dims a KV step
 // may take.
 const _: () = assert!(
-    ATTN_BF16_HEAD_DIMS.len() == 2
-        && ATTN_BF16_HEAD_DIMS[0] == ATTN_PREFILL_BF16_HEAD_DIM
-        && ATTN_BF16_HEAD_DIMS[0] == ATTN_DECODE_BF16_HEAD_DIM
-        && ATTN_BF16_HEAD_DIMS[1] == ATTN_D512_BF16_HEAD_DIM
+    ATTN_BF16_HEAD_DIMS.len() == 3
+        && ATTN_BF16_HEAD_DIMS[0] == ATTN_D128_BF16_HEAD_DIM
+        && ATTN_BF16_HEAD_DIMS[1] == ATTN_PREFILL_BF16_HEAD_DIM
+        && ATTN_BF16_HEAD_DIMS[1] == ATTN_DECODE_BF16_HEAD_DIM
+        && ATTN_BF16_HEAD_DIMS[2] == ATTN_D512_BF16_HEAD_DIM
 );
 /// The one head dim the decode attention kernel is instantiated for: its query, K and V tiles are
 /// `st_bf<64, 256>`, the prefill's (`kernels/attn_decode_bf16.cu`). It takes one query row,
@@ -451,11 +474,12 @@ pub const ATTN_DECODE_BF16_HEAD_DIM: u32 = 256;
 /// stacked as the rows of one query tile, and only the 16 rows of each consumer warpgroup's warp 0
 /// are merged and stored (`kernels/attn_decode_bf16.cu`). The target models' groups are 2 to 12.
 pub const ATTN_DECODE_BF16_MAX_GROUP: u32 = 16;
-/// The head dims the KV append is instantiated for (`kernels/kv_append_bf16.cu`): a head's row is
-/// one `sv_bf<256>`, one 512-byte box of the cache's vector tensor map, or one `sv_bf<512>`, two
-/// such boxes (Gemma 4's global layers). The lowering already refuses any other head dim for a
-/// `RopeAppend` (`CanonicalRefusal::KvHeadDim`).
-pub const KV_APPEND_BF16_HEAD_DIMS: &[u32] = &[256, 512];
+/// The head dims the KV append takes (`kernels/kv_append_bf16.cu`): a head's row is one
+/// `sv_bf<256>`, one 512-byte box of the cache's vector tensor map, or one `sv_bf<512>`, two such
+/// boxes (Gemma 4's global layers); and 128 (GLM-4.5-Air), whose instantiation is #938's 14b, so
+/// the worker refuses an append at it with `ForwardError::NotLaunched`. The lowering already
+/// refuses any other head dim for a `RopeAppend` (`CanonicalRefusal::KvHeadDim`).
+pub const KV_APPEND_BF16_HEAD_DIMS: &[u32] = &[ATTN_D128_BF16_HEAD_DIM, 256, 512];
 
 /// K's partial rope, then the paged-cache write of the rotated K and the unrotated V.
 ///
@@ -862,6 +886,11 @@ pub enum RouteProgram {
         /// `scale` as its bits (`f32::to_bits`).
         scale_bits: u32,
     },
+    /// GLM (DeepSeek-V3's noaux_tc at one group): `sigmoid(logits)` in f32, the top-k of the
+    /// sigmoids plus the f32 `[experts]` correction bias at `bias_offset` bytes into the MoE
+    /// bundle `bias` ([`moe_bundle_biased`]), the UNBIASED sigmoids of the picks gathered,
+    /// renormalised when `renorm`. Its kernel is #938's 14b: the worker refuses it until then.
+    GlmSigmoidBias { bias: WeightIx, bias_offset: u64 },
 }
 
 /// The `P = m · top_k` (token, pick) pairs sorted by expert, stably: every live tile of the
@@ -1080,6 +1109,33 @@ pub const fn expert_bank(experts: u32, hidden: u32, inter: u32) -> Option<MoeBun
         gate_up: 0,
         down: b.down - b.gate_up,
         bytes: b.bytes - b.gate_up,
+    })
+}
+
+/// A GLM MoE layer's bundle: [`moe_bundle`]'s regions, then the router's f32 `[experts]`
+/// correction bias at the first multiple of `CUDA_ARENA_ALIGN` after them, and the total.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BiasedMoeBundle {
+    pub experts: MoeBundle,
+    pub bias: u64,
+    pub bytes: u64,
+}
+
+/// [`BiasedMoeBundle`] for one layer's geometry, or `None` when a byte count overflows `u64`.
+pub const fn moe_bundle_biased(experts: u32, hidden: u32, inter: u32) -> Option<BiasedMoeBundle> {
+    let Some(b) = moe_bundle(experts, hidden, inter) else {
+        return None;
+    };
+    let Some(bias) = b.bytes.checked_next_multiple_of(CUDA_ARENA_ALIGN) else {
+        return None;
+    };
+    let Some(bytes) = bias.checked_add(experts as u64 * F32_BYTES) else {
+        return None;
+    };
+    Some(BiasedMoeBundle {
+        experts: b,
+        bias,
+        bytes,
     })
 }
 
@@ -1444,17 +1500,26 @@ impl CudaStep {
                 experts,
                 top_k,
                 expert_scale,
+                program,
                 ..
             }) => {
                 let (Some(lb), Some(pairs)) = (bf16_bytes(m, experts), m.checked_mul(top_k)) else {
                     return None;
                 };
-                let weight = match expert_scale {
-                    Some(ix) => Some(WeightRead {
+                let weight = match (program, expert_scale) {
+                    // GLM's routing reads its bundle up to the end of the correction bias.
+                    (RouteProgram::GlmSigmoidBias { bias, bias_offset }, _) => {
+                        let Some(bytes) = bias_offset.checked_add(experts as u64 * F32_BYTES)
+                        else {
+                            return None;
+                        };
+                        Some(WeightRead { ix: bias, bytes })
+                    }
+                    (_, Some(ix)) => Some(WeightRead {
                         ix,
                         bytes: experts as u64 * CUDA_ACT_BYTES,
                     }),
-                    None => None,
+                    (_, None) => None,
                 };
                 Some(StepExtents {
                     reads: [Some(span(logits, lb)), None, None, None],
@@ -1677,6 +1742,29 @@ impl CudaStep {
                     in_place: false,
                 })
             }
+            Self::BiasAdd(BiasAddBf16 {
+                x,
+                bias,
+                out,
+                rows,
+                cols,
+            }) => {
+                let (Some(bytes), Some(bb)) = (bf16_bytes(rows, cols), bf16_bytes(1, cols)) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [Some(span(x, bytes)), None, None, None],
+                    writes: span(out, bytes),
+                    second_write: None,
+                    weight: Some(WeightRead {
+                        ix: bias,
+                        bytes: bb,
+                    }),
+                    kv: None,
+                    gdn: None,
+                    in_place: false,
+                })
+            }
         }
     }
 }
@@ -1771,6 +1859,11 @@ impl CudaStep {
             Self::RmsNorm(RmsNormBf16 { gain, .. })
             | Self::RouterNorm(RmsNormBf16 { gain, .. }) => Some(gain),
             Self::LayerScale(LayerScaleBf16 { scale, .. }) => Some(scale),
+            Self::BiasAdd(BiasAddBf16 { bias, .. }) => Some(bias),
+            Self::MoeRoute(MoeRouteBf16 {
+                program: RouteProgram::GlmSigmoidBias { bias, .. },
+                ..
+            }) => Some(bias),
             Self::MoeRoute(MoeRouteBf16 { expert_scale, .. }) => expert_scale.as_mut(),
             Self::GatedDeltaNet(GatedDeltaNetBf16 { bundle, .. }) => Some(bundle),
             Self::RouterLogits(RouterLogitsBf16 { bundle, .. }) => Some(bundle),

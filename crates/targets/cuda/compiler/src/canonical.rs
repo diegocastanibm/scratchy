@@ -34,7 +34,8 @@ use scratchy_target_cuda::op_abi::{
     CUDA_SORTED_PAIRS, CudaFusion,
 };
 use scratchy_target_cuda::step::{
-    CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, GDN_SEQUENCE_BYTES, gdn_scratch,
+    CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, GDN_SEQUENCE_BYTES, MoeRouteBf16,
+    RouteProgram, gdn_scratch,
 };
 use scratchy_target_cuda::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, KvClass, MoeSortTape, MoeTape,
@@ -1484,17 +1485,27 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         None => TapeInput::Hidden(span(Colour::ZERO)),
     };
     // A GDN or MoE step's bundle is a `[1, 1]` source in the IR; on the device it is the packed
-    // bundle of the step's geometry (`gdn_bundle`, `moe_bundle`), which its extents read.
-    let bundles: BTreeMap<u32, u64> = (steps.iter())
-        .filter_map(|s| match s {
-            CudaStep::GatedDeltaNet(g) => Some((g.bundle.0, g.bundle_layout()?.bytes)),
-            CudaStep::RouterLogits(_) | CudaStep::ExpertGemm(_) | CudaStep::ExpertGemv(_) => {
-                let w = s.extents()?.weight?;
-                Some((w.ix.0, w.bytes))
-            }
-            _ => None,
-        })
-        .collect();
+    // bundle of the step's geometry (`gdn_bundle`, `moe_bundle`, `moe_bundle_biased`), which its
+    // extents read. GLM's routing reads its bundle further than the router and expert steps do,
+    // to the correction bias, so a bundle is the most any step reads of it.
+    let mut bundles: BTreeMap<u32, u64> = BTreeMap::new();
+    for (ix, bytes) in steps.iter().filter_map(|s| match s {
+        CudaStep::GatedDeltaNet(g) => Some((g.bundle.0, g.bundle_layout()?.bytes)),
+        CudaStep::RouterLogits(_)
+        | CudaStep::ExpertGemm(_)
+        | CudaStep::ExpertGemv(_)
+        | CudaStep::MoeRoute(MoeRouteBf16 {
+            program: RouteProgram::GlmSigmoidBias { .. },
+            ..
+        }) => {
+            let w = s.extents()?.weight?;
+            Some((w.ix.0, w.bytes))
+        }
+        _ => None,
+    }) {
+        let most = bundles.entry(ix).or_insert(bytes);
+        *most = (*most).max(bytes);
+    }
     let weight_bytes = (plan.lowered.bindings.iter().enumerate())
         .map(|(t, binding)| match binding {
             SourceBinding::Weight { .. } | SourceBinding::BundleTensor { .. } => {

@@ -49,8 +49,9 @@ use scratchy_subtile::handoff::{
 };
 use scratchy_target_cuda::op_abi::CUDA_GEMM_COL64_ARCHS;
 use scratchy_target_cuda::step::{
-    CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, GatedDeltaNetBf16, GemmBf16,
-    LayerScaleBf16, MoeRouteBf16, MoeWeight, RmsNormBf16, RouterLogitsBf16, gdn_conv_dim,
+    BiasAddBf16, CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, GatedDeltaNetBf16, GemmBf16,
+    LayerScaleBf16, MoeRouteBf16, MoeWeight, RmsNormBf16, RouteProgram, RouterLogitsBf16,
+    gdn_conv_dim, moe_bundle_biased,
 };
 use scratchy_target_cuda::tape::{ArenaLayout, CudaTape, GdnTape, KvTape, TapeError, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
@@ -118,6 +119,7 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "RmsNormUnitBf16",
                 "LayerScaleBf16",
                 "SoftCapBf16",
+                "BiasAddBf16",
             ],
         },
         ModuleRow {
@@ -456,6 +458,9 @@ enum Role {
     Bundle([u32; 4]),
     /// One MoE layer's dense bundle of this geometry: `experts`, `hidden`, `inter`.
     MoeBundle([u32; 3]),
+    /// One GLM MoE layer's dense bundle of this geometry, its router's correction bias appended:
+    /// `experts`, `hidden`, `inter`.
+    MoeBundleBiased([u32; 3]),
     /// One Gemma layer's dense expert bank of this geometry: `experts`, `hidden`, `inter`.
     ExpertBank([u32; 3]),
 }
@@ -464,7 +469,10 @@ impl Role {
     fn shape(&self) -> &[u64] {
         match self {
             Self::Bf16(dims, rank) | Self::Param(dims, rank) => &dims[..*rank],
-            Self::Bundle(_) | Self::MoeBundle(_) | Self::ExpertBank(_) => &[],
+            Self::Bundle(_)
+            | Self::MoeBundle(_)
+            | Self::MoeBundleBiased(_)
+            | Self::ExpertBank(_) => &[],
         }
     }
 }
@@ -489,6 +497,17 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             Some((gain, Role::Bf16([u64::from(cols), 0], 1)))
         }
         CudaStep::LayerScale(LayerScaleBf16 { scale, .. }) => Some((scale, Role::Param([1, 0], 1))),
+        // A bias is a bare parameter, `{prefix}` with no `.weight` leaf (GLM's
+        // `self_attn.q_proj.bias`).
+        CudaStep::BiasAdd(BiasAddBf16 { bias, cols, .. }) => {
+            Some((bias, Role::Param([u64::from(cols), 0], 1)))
+        }
+        // GLM's routing reads its router's bundle to the correction bias: [`weight_table`] makes
+        // that bundle's role [`Role::MoeBundleBiased`] ([`biased_bundle`]), so it has none here.
+        CudaStep::MoeRoute(MoeRouteBf16 {
+            program: RouteProgram::GlmSigmoidBias { .. },
+            ..
+        }) => None,
         CudaStep::MoeRoute(MoeRouteBf16 {
             expert_scale: Some(ix),
             experts,
@@ -583,6 +602,19 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
     }
 }
 
+/// The bundle a GLM routing step reads its correction bias from, and the offset it reads it at:
+/// `None` for every other step.
+fn biased_bundle(step: &CudaStep) -> Option<(WeightIx, u64)> {
+    let CudaStep::MoeRoute(MoeRouteBf16 {
+        program: RouteProgram::GlmSigmoidBias { bias, bias_offset },
+        ..
+    }) = *step
+    else {
+        return None;
+    };
+    Some((bias, bias_offset))
+}
+
 /// `s` as a `'static` str, for a [`CudaWeight`] built at expansion time only to be rendered as
 /// tokens. The build-script process exits after the expansion.
 fn baked_str(s: String) -> &'static str {
@@ -641,6 +673,32 @@ pub fn weight_table(
                 }
                 _ => roles[ix] = Some(role),
             }
+        }
+    }
+    // A bundle a GLM routing reads its correction bias from is that bundle with the bias
+    // appended: its router and expert steps' role, at the offset their geometry places the bias.
+    for tape in tapes.iter() {
+        for step in &tape.steps {
+            let Some((WeightIx(ix), offset)) = biased_bundle(step) else {
+                continue;
+            };
+            let ix = ix as usize;
+            roles[ix] = match roles[ix] {
+                Some(Role::MoeBundle(g @ [experts, hidden, inter]))
+                | Some(Role::MoeBundleBiased(g @ [experts, hidden, inter]))
+                    if moe_bundle_biased(experts, hidden, inter).map(|b| b.bias)
+                        == Some(offset) =>
+                {
+                    Some(Role::MoeBundleBiased(g))
+                }
+                other => {
+                    return Err(ModelRefusal::WeightRole {
+                        ix,
+                        first: format!("{other:?}"),
+                        other: format!("a GLM routing's correction bias at byte {offset}"),
+                    });
+                }
+            };
         }
     }
     let declared = |ix: usize| {
@@ -723,6 +781,16 @@ pub fn weight_table(
                 router: baked_str(format!("{prefix}.gate.weight")),
                 gate_up: baked_str(format!("{prefix}.experts.gate_up_proj")),
                 down: baked_str(format!("{prefix}.experts.down_proj")),
+                experts,
+                hidden,
+                inter,
+            },
+            // GLM's checkpoint stores each expert's projections as tensors of their own, which
+            // the loader stacks into the bundle's layout, and the router's correction bias in f32.
+            Role::MoeBundleBiased([experts, hidden, inter]) => CudaWeight::MoeBundleStacked {
+                router: baked_str(format!("{prefix}.gate.weight")),
+                experts_prefix: baked_str(format!("{prefix}.experts")),
+                correction_bias: baked_str(format!("{prefix}.gate.e_score_correction_bias")),
                 experts,
                 hidden,
                 inter,
@@ -810,7 +878,7 @@ fn bundle_entry(
             hidden,
             inter,
         },
-        Role::Bundle(_) | Role::MoeBundle(_) => return None,
+        Role::Bundle(_) | Role::MoeBundle(_) | Role::MoeBundleBiased(_) => return None,
     })
 }
 

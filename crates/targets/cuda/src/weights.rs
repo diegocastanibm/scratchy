@@ -12,8 +12,9 @@
 //! [`check`] checks every entry against the checkpoint's header before anything is allocated, and
 //! [`stage`] makes one entry's host bytes. The upload is `runtime::load_weights`, under `nvcc`.
 //!
-//! Every conversion is exact: a bf16 tensor is uploaded byte for byte, and a GDN bundle's pieces
-//! are widened to f32, which loses nothing from bf16 or f32.
+//! Every conversion is exact: a bf16 tensor is uploaded byte for byte, a GDN bundle's pieces
+//! are widened to f32, which loses nothing from bf16 or f32, and a GLM bundle's correction bias is
+//! f32 on disk and uploaded byte for byte.
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +22,7 @@ use scratchy_layers::weights::GpuWeights;
 use scratchy_tensors::{DType, DeviceAllocator, PoolMemory};
 use serde::Serialize;
 
-use crate::step::{expert_bank, gdn_bundle, moe_bundle};
+use crate::step::{expert_bank, gdn_bundle, moe_bundle, moe_bundle_biased};
 use crate::tape::CudaTape;
 
 /// How one weight index is filled from the checkpoint.
@@ -72,7 +73,35 @@ pub enum CudaWeight {
         hidden: u32,
         inter: u32,
     },
+    /// GLM's dense bf16 MoE bundle (`step::moe_bundle_biased`), stacked at load from per-expert
+    /// tensors into exactly [`Self::MoeBundle`]'s layout, each uploaded byte for byte: `router`
+    /// `[experts, hidden]` (`{prefix}.gate.weight`); for each expert `e` in order its
+    /// `{experts_prefix}.{e}.gate_proj.weight` then `up_proj.weight`, each `[inter, hidden]`; then
+    /// for each `e` its `down_proj.weight`, `[hidden, inter]`; then, at the aligned offset after
+    /// them, the f32 `[experts]` `correction_bias` (`{prefix}.gate.e_score_correction_bias`). The
+    /// fused 3-D form is refused, naming the per-expert tensor it lacks.
+    MoeBundleStacked {
+        router: &'static str,
+        experts_prefix: &'static str,
+        correction_bias: &'static str,
+        experts: u32,
+        hidden: u32,
+        inter: u32,
+    },
 }
+
+/// The per-expert projections of a [`CudaWeight::MoeBundleStacked`], in the order each expert's
+/// gate-up slab stacks them (`gate_proj` then `up_proj`), then the down slab's.
+const STACKED_GATE_UP: [&str; 2] = ["gate_proj", "up_proj"];
+const STACKED_DOWN: &str = "down_proj";
+
+/// `{experts_prefix}.{e}.{proj}.weight`, one expert's projection in a per-expert checkpoint.
+fn per_expert(experts_prefix: &str, e: u32, proj: &str) -> String {
+    format!("{experts_prefix}.{e}.{proj}.weight")
+}
+
+/// The dtypes a GLM correction bias may have on disk: f32 only, never converted.
+const BIAS_DTYPES: &[DType] = &[DType::F32];
 
 /// The dtypes a dense tensor may have on disk: bf16 only, never converted.
 const DENSE_DTYPES: &[DType] = &[DType::BF16];
@@ -81,7 +110,7 @@ const GDN_DTYPES: &[DType] = &[DType::BF16, DType::F32];
 
 /// One checkpoint tensor an entry reads, the dtypes it may have, and the shape it must have.
 struct Read {
-    tensor: &'static str,
+    tensor: std::borrow::Cow<'static, str>,
     accepted: &'static [DType],
     shape: Vec<u64>,
 }
@@ -94,6 +123,7 @@ impl CudaWeight {
             Self::GdnBundle { conv1d, .. } => conv1d,
             Self::MoeBundle { router, .. } => router,
             Self::ExpertBank { gate_up, .. } => gate_up,
+            Self::MoeBundleStacked { router, .. } => router,
         }
     }
 
@@ -101,7 +131,7 @@ impl CudaWeight {
     fn reads(&self) -> Vec<Read> {
         match *self {
             Self::Bf16 { tensor, shape } => vec![Read {
-                tensor,
+                tensor: tensor.into(),
                 accepted: DENSE_DTYPES,
                 shape: shape.to_vec(),
             }],
@@ -115,8 +145,8 @@ impl CudaWeight {
                 nv,
                 head_v,
             } => {
-                let read = |tensor, shape: &[u32]| Read {
-                    tensor,
+                let read = |tensor: &'static str, shape: &[u32]| Read {
+                    tensor: tensor.into(),
                     accepted: GDN_DTYPES,
                     shape: shape.iter().map(|&d| u64::from(d)).collect(),
                 };
@@ -135,8 +165,8 @@ impl CudaWeight {
                 hidden,
                 inter,
             } => {
-                let read = |tensor, shape: &[u32]| Read {
-                    tensor,
+                let read = |tensor: &'static str, shape: &[u32]| Read {
+                    tensor: tensor.into(),
                     accepted: DENSE_DTYPES,
                     shape: shape.iter().map(|&d| u64::from(d)).collect(),
                 };
@@ -153,8 +183,8 @@ impl CudaWeight {
                 hidden,
                 inter,
             } => {
-                let read = |tensor, shape: &[u32]| Read {
-                    tensor,
+                let read = |tensor: &'static str, shape: &[u32]| Read {
+                    tensor: tensor.into(),
                     accepted: DENSE_DTYPES,
                     shape: shape.iter().map(|&d| u64::from(d)).collect(),
                 };
@@ -162,6 +192,37 @@ impl CudaWeight {
                     read(gate_up, &[experts, 2 * inter, hidden]),
                     read(down, &[experts, hidden, inter]),
                 ]
+            }
+            Self::MoeBundleStacked {
+                router,
+                experts_prefix,
+                correction_bias,
+                experts,
+                hidden,
+                inter,
+            } => {
+                let dense = |tensor: std::borrow::Cow<'static, str>, shape: [u32; 2]| Read {
+                    tensor,
+                    accepted: DENSE_DTYPES,
+                    shape: shape.iter().map(|&d| u64::from(d)).collect(),
+                };
+                let mut reads = vec![dense(router.into(), [experts, hidden])];
+                for e in 0..experts {
+                    for proj in STACKED_GATE_UP {
+                        let name = per_expert(experts_prefix, e, proj);
+                        reads.push(dense(name.into(), [inter, hidden]));
+                    }
+                }
+                for e in 0..experts {
+                    let name = per_expert(experts_prefix, e, STACKED_DOWN);
+                    reads.push(dense(name.into(), [hidden, inter]));
+                }
+                reads.push(Read {
+                    tensor: correction_bias.into(),
+                    accepted: BIAS_DTYPES,
+                    shape: vec![u64::from(experts)],
+                });
+                reads
             }
         }
     }
@@ -189,6 +250,12 @@ impl CudaWeight {
                 inter,
                 ..
             } => expert_bank(experts, hidden, inter).map(|b| b.bytes),
+            Self::MoeBundleStacked {
+                experts,
+                hidden,
+                inter,
+                ..
+            } => moe_bundle_biased(experts, hidden, inter).map(|b| b.bytes),
         }
     }
 }
@@ -213,6 +280,11 @@ pub enum LoadError {
     /// projections as tensors of their own (`experts.{e}.gate_proj.weight`), a form this loader does
     /// not take.
     PerExpertTensors { ix: usize, tensor: &'static str },
+    /// Weight `ix`, a GLM MoE bundle stacked from per-expert tensors, reads `tensor`
+    /// (`experts.{e}.gate_proj.weight` and the like), which the checkpoint does not hold: it stores
+    /// the experts as the fused 3-D `experts.gate_up_proj`, a form this entry does not take. The
+    /// mirror of [`LoadError::PerExpertTensors`].
+    FusedExperts { ix: usize, tensor: &'static str },
     /// Weight `ix` reads `tensor`, which is `got` on disk; it may be one of `accepted`.
     Dtype {
         ix: usize,
@@ -266,6 +338,11 @@ impl std::fmt::Display for LoadError {
                 f,
                 "weight {ix}: the checkpoint has no fused expert tensor {tensor}; it stores each \
                  expert's projections as tensors of their own, which the CUDA loader does not take"
+            ),
+            Self::FusedExperts { ix, tensor } => write!(
+                f,
+                "weight {ix}: the checkpoint has no per-expert tensor {tensor}; it stores the experts \
+                 as fused 3-D tensors, which this bundle's entry does not take"
             ),
             Self::Dtype {
                 ix,
@@ -350,6 +427,15 @@ impl DeviceAllocator for HostStaging {
     }
 }
 
+/// `name` as the `'static` str a [`LoadError`] names: a per-expert tensor's name is built at
+/// load, so it is leaked, once, on the refusal path only.
+fn named(name: std::borrow::Cow<'static, str>) -> &'static str {
+    match name {
+        std::borrow::Cow::Borrowed(s) => s,
+        std::borrow::Cow::Owned(s) => Box::leak(s.into_boxed_str()),
+    }
+}
+
 /// Weight `ix`'s tensors, by `weights`' header: each present, of an accepted dtype, of exactly
 /// the shape the entry needs.
 fn check_tensors<A: DeviceAllocator>(
@@ -358,23 +444,15 @@ fn check_tensors<A: DeviceAllocator>(
     weights: &GpuWeights<A>,
 ) -> Result<(), LoadError> {
     for Read {
-        tensor,
+        tensor: name,
         accepted,
         shape,
     } in entry.reads()
     {
-        let missing = || match *entry {
-            CudaWeight::MoeBundle { router, .. } if tensor != router => {
-                let base = tensor.rsplit_once(".experts.").map_or(tensor, |(b, _)| b);
-                let per_expert = format!("{base}.experts.0.gate_proj.weight");
-                match weights.tensor_info(&per_expert) {
-                    Some(_) => LoadError::PerExpertTensors { ix, tensor },
-                    None => LoadError::Missing { ix, tensor },
-                }
-            }
-            _ => LoadError::Missing { ix, tensor },
+        let Some((got, dtype)) = weights.tensor_info(&name) else {
+            return Err(missing(ix, entry, named(name), weights));
         };
-        let (got, dtype) = (weights.tensor_info(tensor)).ok_or_else(missing)?;
+        let tensor = named(name);
         if !accepted.contains(&dtype) {
             return Err(LoadError::Dtype {
                 ix,
@@ -394,6 +472,42 @@ fn check_tensors<A: DeviceAllocator>(
         }
     }
     Ok(())
+}
+
+/// Why weight `ix`'s `tensor` is missing: a fused bundle's expert tensor in a per-expert
+/// checkpoint, a stacked bundle's per-expert tensor in a fused checkpoint, or simply absent.
+fn missing<A: DeviceAllocator>(
+    ix: usize,
+    entry: &CudaWeight,
+    tensor: &'static str,
+    weights: &GpuWeights<A>,
+) -> LoadError {
+    match *entry {
+        CudaWeight::MoeBundle { router, .. } if tensor != router => {
+            let base = tensor.rsplit_once(".experts.").map_or(tensor, |(b, _)| b);
+            let per_expert = format!("{base}.experts.0.gate_proj.weight");
+            match weights.tensor_info(&per_expert) {
+                Some(_) => LoadError::PerExpertTensors { ix, tensor },
+                None => LoadError::Missing { ix, tensor },
+            }
+        }
+        CudaWeight::MoeBundleStacked { experts_prefix, .. }
+            if tensor.starts_with(experts_prefix) =>
+        {
+            let base = experts_prefix
+                .strip_suffix(".experts")
+                .unwrap_or(experts_prefix);
+            match weights.tensor_info(&format!("{base}.experts.gate_up_proj")) {
+                Some(_) => LoadError::FusedExperts { ix, tensor },
+                None => LoadError::Missing { ix, tensor },
+            }
+        }
+        CudaWeight::MoeBundle { .. }
+        | CudaWeight::MoeBundleStacked { .. }
+        | CudaWeight::Bf16 { .. }
+        | CudaWeight::GdnBundle { .. }
+        | CudaWeight::ExpertBank { .. } => LoadError::Missing { ix, tensor },
+    }
 }
 
 /// Little-endian `bytes` of `dtype` (bf16 or f32, which [`check_tensors`] accepted) as f32, read
@@ -546,6 +660,37 @@ pub fn stage<A: DeviceAllocator>(
             for tensor in [gate_up, down] {
                 let (bytes, ..) =
                     (weights.take_to_cpu_bytes(tensor)).map_err(|_| missing(tensor))?;
+                packed.extend_from_slice(&bytes);
+            }
+            Ok(packed)
+        }
+        CudaWeight::MoeBundleStacked {
+            experts,
+            hidden,
+            inter,
+            correction_bias,
+            ..
+        } => {
+            let layout = moe_bundle_biased(experts, hidden, inter).ok_or(LoadError::Bytes {
+                ix,
+                tensor: Some(entry.lead()),
+                packed: u64::MAX,
+                declared: 0,
+            })?;
+            // `check_tensors` checked each piece is of its dtype and shape, and `reads` lists them
+            // in the bundle's order: the router, each expert's gate then up, each expert's down
+            // (back to back, `step::moe_bundle`'s layout), then the f32 bias, after zero padding
+            // up to its aligned offset.
+            let mut packed = Vec::with_capacity(layout.bytes as usize);
+            for Read { tensor, .. } in entry.reads() {
+                if tensor == correction_bias {
+                    packed.resize(layout.bias as usize, 0);
+                }
+                let (bytes, ..) =
+                    (weights.take_to_cpu_bytes(&tensor)).map_err(|_| LoadError::Missing {
+                        ix,
+                        tensor: named(tensor),
+                    })?;
                 packed.extend_from_slice(&bytes);
             }
             Ok(packed)

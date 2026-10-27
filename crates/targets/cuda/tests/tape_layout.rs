@@ -1527,14 +1527,14 @@ fn an_attention_off_the_cta_rows_is_refused() {
 #[test]
 fn an_attention_of_another_head_dim_is_refused() {
     let e = refused(
-        &attn_only(256, geom(16, 4, 128)),
-        &["AttnDecode", "head_dim=128", "256"],
+        &attn_only(256, geom(16, 4, 192)),
+        &["AttnDecode", "head_dim=192", "256"],
     );
     assert!(matches!(
         e,
         CanonicalRefusal::AttnShape {
             step: 0,
-            head_dim: 128,
+            head_dim: 192,
             rule: AttnShapeRule::HeadDim { want: 256 },
             ..
         }

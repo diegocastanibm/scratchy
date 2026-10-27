@@ -38,12 +38,12 @@ use scratchy_subtile::paged_kv_layout::PagedKvLayout;
 use crate::kernels::{self, KernelError};
 use crate::rotary::fill_rotary_rows_with_freq_dim;
 use crate::step::{
-    ATTN_D512_BF16_HEAD_DIM, ATTN_DECODE_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, AddBf16,
-    AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16,
-    ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
-    GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16,
-    MoeWeight, PairRows, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
-    RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16,
+    ATTN_D128_BF16_HEAD_DIM, ATTN_D512_BF16_HEAD_DIM, ATTN_DECODE_BF16_HEAD_DIM,
+    ATTN_PREFILL_BF16_HEAD_DIM, AddBf16, AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16,
+    ExpertGemmBf16, ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16,
+    GateSplitBf16, GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel,
+    MoeRouteBf16, MoeWeight, PairRows, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16,
+    RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape,
@@ -308,8 +308,9 @@ pub enum ForwardError {
     /// The `step`-th launch failed; nothing after it was enqueued, and the stream was drained.
     Launch { step: usize, error: KernelError },
     /// The `step`-th step is `op`, a step no kernel launches: a Qwen routing at another count than
-    /// [`MOE_ROUTE_EXPERTS`], the Qwen program's one instance (#921). Checked over the whole tape
-    /// before anything is uploaded or enqueued.
+    /// [`MOE_ROUTE_EXPERTS`], the Qwen program's one instance (#921); GLM's bias add and routing,
+    /// and an append or attention at head dim [`ATTN_D128_BF16_HEAD_DIM`] (#938's 14b). Checked
+    /// over the whole tape before anything is uploaded or enqueued.
     NotLaunched { step: usize, op: &'static str },
     /// A copy or the stream wait failed; the stream was drained.
     Cuda(CudaError),
@@ -578,21 +579,67 @@ fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, 
     Some((offsets, per_layer.checked_mul(layers as u64)?))
 }
 
-/// The name of `s` when no kernel launches it: the Qwen routing at another count than
-/// [`MOE_ROUTE_EXPERTS`]. The routing kernel's Qwen program is instantiated at 256 only (its
-/// launcher refuses any other count), so such a tape is refused before anything is enqueued,
-/// rather than at its routing step. `None` for every other step.
+/// The name of `s` when no kernel launches it, so a tape holding it is refused before anything is
+/// enqueued, rather than at that step:
+/// - the Qwen routing at another count than [`MOE_ROUTE_EXPERTS`]: the routing kernel's Qwen
+///   program is instantiated at 256 only (its launcher refuses any other count);
+/// - GLM's bias add and its sigmoid-and-bias routing, and a KV append or an attention at head dim
+///   [`ATTN_D128_BF16_HEAD_DIM`]: their kernels are #938's 14b, which removes these arms.
+///
+/// `None` for every other step. Every variant is named, so a new step states its case here.
 fn not_launched(s: &CudaStep) -> Option<&'static str> {
-    if let CudaStep::MoeRoute(MoeRouteBf16 {
-        program: RouteProgram::QwenSoftmax,
-        experts,
-        ..
-    }) = *s
-        && experts != MOE_ROUTE_EXPERTS
-    {
-        return Some("MoeRoute");
+    match *s {
+        CudaStep::MoeRoute(MoeRouteBf16 {
+            program: RouteProgram::QwenSoftmax,
+            experts,
+            ..
+        }) if experts != MOE_ROUTE_EXPERTS => Some("MoeRoute"),
+        CudaStep::MoeRoute(MoeRouteBf16 {
+            program: RouteProgram::GlmSigmoidBias { .. },
+            ..
+        }) => Some("MoeRoute"),
+        CudaStep::BiasAdd(_) => Some("BiasAdd"),
+        CudaStep::RopeAppend(RopeAppendBf16 {
+            head_dim: ATTN_D128_BF16_HEAD_DIM,
+            ..
+        }) => Some("RopeAppend"),
+        CudaStep::AttnPrefill(AttnPrefillBf16 {
+            head_dim: ATTN_D128_BF16_HEAD_DIM,
+            ..
+        }) => Some("AttnPrefill"),
+        CudaStep::AttnDecode(AttnPrefillBf16 {
+            head_dim: ATTN_D128_BF16_HEAD_DIM,
+            ..
+        }) => Some("AttnDecode"),
+        CudaStep::MoeRoute(_)
+        | CudaStep::RopeAppend(_)
+        | CudaStep::AttnPrefill(_)
+        | CudaStep::AttnDecode(_)
+        | CudaStep::Embed(_)
+        | CudaStep::Gemm(_)
+        | CudaStep::GemmNarrow(_)
+        | CudaStep::Gemv(_)
+        | CudaStep::RmsNorm(_)
+        | CudaStep::Add(_)
+        | CudaStep::SiluMul(_)
+        | CudaStep::Rope(_)
+        | CudaStep::GateSplit(_)
+        | CudaStep::GateApply(_)
+        | CudaStep::GatedDeltaNet(_)
+        | CudaStep::RouterLogits(_)
+        | CudaStep::ExpertSort(_)
+        | CudaStep::ExpertGemm(_)
+        | CudaStep::ExpertGemv(_)
+        | CudaStep::ExpertCombine(_)
+        | CudaStep::GateScale(_)
+        | CudaStep::Scale(_)
+        | CudaStep::RmsNormUnit(_)
+        | CudaStep::GeluMul(_)
+        | CudaStep::LayerScale(_)
+        | CudaStep::SoftCap(_)
+        | CudaStep::RouterNorm(_)
+        | CudaStep::GemmCol64(_) => None,
     }
-    None
 }
 
 /// The one GDN geometry of `tapes`: the first GDN tape's, which every other GDN tape must share.
@@ -1323,6 +1370,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // `forward` checked is inside the pool.
         for (step, s) in tape.steps.iter().enumerate() {
             let launched = match *s {
+                // No kernel yet (#938's 14b): `not_launched` refused the tape before any copy, so
+                // this arm is never reached.
+                CudaStep::BiasAdd(_) => {
+                    return Err(ForwardError::NotLaunched {
+                        step,
+                        op: "BiasAdd",
+                    });
+                }
                 CudaStep::GemmCol64(GemmBf16 { a, b, c, m, n, k }) => {
                     let b = weights[b.0 as usize].ptr();
                     // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
@@ -1522,6 +1577,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             stream.0,
                         )
                     },
+                    // No kernel yet (#938's 14b): `not_launched` refused the tape before any
+                    // copy, so this arm is never reached.
+                    (RouteProgram::GlmSigmoidBias { .. }, _) => {
+                        return Err(ForwardError::NotLaunched {
+                            step,
+                            op: "MoeRoute",
+                        });
+                    }
                     (RouteProgram::GemmaScaledSoftmax { scale_bits }, pes) => {
                         // A Gemma routing with no per-expert scale is the launcher's refusal (a
                         // null pointer), before it touches any pointer.
@@ -1780,6 +1843,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     let launch: PrefillLaunch = match head_dim {
                         ATTN_PREFILL_BF16_HEAD_DIM => kernels::attn_prefill_windowed_bf16,
                         ATTN_D512_BF16_HEAD_DIM => kernels::attn_prefill_d512_bf16,
+                        // No kernel yet (#938's 14b): `not_launched` refused the tape before any
+                        // copy, so this arm is never reached.
+                        ATTN_D128_BF16_HEAD_DIM => {
+                            return Err(ForwardError::NotLaunched {
+                                step,
+                                op: "AttnPrefill",
+                            });
+                        }
                         // No prefill attention kernel at another head dim: refused, nothing
                         // launched (`validate` already refuses it: `ATTN_BF16_HEAD_DIMS`).
                         other => {
@@ -1830,6 +1901,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     let launch: DecodeLaunch = match head_dim {
                         ATTN_DECODE_BF16_HEAD_DIM => kernels::attn_decode_windowed_bf16,
                         ATTN_D512_BF16_HEAD_DIM => kernels::attn_decode_d512_bf16,
+                        // No kernel yet (#938's 14b): `not_launched` refused the tape before any
+                        // copy, so this arm is never reached.
+                        ATTN_D128_BF16_HEAD_DIM => {
+                            return Err(ForwardError::NotLaunched {
+                                step,
+                                op: "AttnDecode",
+                            });
+                        }
                         // No decode attention kernel at another head dim: refused, nothing
                         // launched (`validate` already refuses it: `ATTN_BF16_HEAD_DIMS`).
                         other => {

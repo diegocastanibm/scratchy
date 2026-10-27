@@ -25,17 +25,17 @@ use scratchy_subtile::tape_folding::{FusedShape, Fusion};
 use scratchy_target_cuda::op_abi::{CUDA_GROUPED_EXPERTS, CudaFusion, MOE_EXPERT_COUNTS};
 use scratchy_target_cuda::step::{
     ADD_BF16_COLS, ATTN_BF16_HEAD_DIMS, ATTN_DECODE_BF16_MAX_GROUP, ATTN_PREFILL_BF16_ROWS,
-    ATTN_WINDOW_MULTIPLE, AddBf16, AttnPrefillBf16, CudaStep, EMBED_BF16_COLS, EmbedBf16,
-    ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection, ExpertSortBf16,
-    GATE_APPLY_BF16_COLS, GATE_SCALE_BF16_COLS, GATE_SPLIT_BF16_HEAD_DIM,
-    GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX,
-    GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_COL64_TILE, GEMM_NARROW_BF16_MAX_N,
+    ATTN_WINDOW_MULTIPLE, AddBf16, AttnPrefillBf16, BIAS_ADD_BF16_COLS, BiasAddBf16, CudaStep,
+    EMBED_BF16_COLS, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16,
+    ExpertProjection, ExpertSortBf16, GATE_APPLY_BF16_COLS, GATE_SCALE_BF16_COLS,
+    GATE_SPLIT_BF16_HEAD_DIM, GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K,
+    GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_COL64_TILE, GEMM_NARROW_BF16_MAX_N,
     GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16,
     GateScaleBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K,
     MatmulKernel, MoeRouteBf16, MoeWeight, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE,
     ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
     RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16,
-    SiluMulBf16, SoftCapBf16,
+    SiluMulBf16, SoftCapBf16, moe_bundle_biased,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
@@ -100,6 +100,7 @@ pub fn lower_step(
         L::MatmulTile { n, weight } => gemm(cx, s, *n, *weight),
         L::RmsNorm { eps, gain } => rms_norm(cx, s, *eps, *gain).map(CudaStep::RmsNorm),
         L::Elementwise(E::Add) => add(cx, s).map(CudaStep::Add),
+        L::Elementwise(E::BiasAdd) => bias_add(cx, s).map(CudaStep::BiasAdd),
         L::Reshape { .. } => return view(cx, s).map(|()| None),
         L::RopeRotate { head_dim, .. } => rope(cx, s, head_dim.get()).map(CudaStep::Rope),
         L::GateSplit { half_cols } => gate_split(cx, s, *half_cols).map(CudaStep::GateSplit),
@@ -147,6 +148,7 @@ pub fn lower_step(
         // softmax or argsort it did not absorb, a top-k driving none, a gather, scale, renorm or
         // per-expert scale no top-k took as its epilogue) has no kernel.
         L::RouteSoftmax
+        | L::RouteSigmoidBias { .. }
         | L::RouteArgsort
         | L::RouteTopK { .. }
         | L::RouteGatherScores
@@ -165,7 +167,7 @@ pub fn lower_step(
             op: op.name(),
         }),
         L::SumReduce { .. }
-        | L::Elementwise(E::Gelu | E::QuickGelu | E::GeluErf | E::Relu2 | E::Sub | E::BiasAdd)
+        | L::Elementwise(E::Gelu | E::QuickGelu | E::GeluErf | E::Relu2 | E::Sub)
         | L::RmsNormReduce { .. }
         | L::RmsNormApply { .. }
         | L::KvAppend { .. }
@@ -177,7 +179,6 @@ pub fn lower_step(
         | L::EncoderAttn { .. }
         | L::Mamba2 { .. }
         | L::Mean
-        | L::RouteSigmoidBias { .. }
         | L::RouteBias { .. }
         | L::ExpertAct { .. }
         | L::KvEncode { .. }
@@ -369,6 +370,33 @@ fn add(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<AddBf16, CanonicalRefusal> {
     Ok(AddBf16 {
         a: at(ac),
         b: at(bc),
+        out: at(colour_of(cx, s.writes)),
+        rows,
+        cols,
+    })
+}
+
+/// `Elementwise(BiasAdd)` as the bf16 bias add (GLM's q, k and v biases): `x` (operand 0) a
+/// computed slot or the embedded hidden of the output's shape, the bias (operand 1) a `[1, cols]`
+/// model weight broadcast over the rows.
+fn bias_add(cx: &StepCx<'_>, s: &TapeStep<'_>) -> Result<BiasAddBf16, CanonicalRefusal> {
+    let (x, b) = match s.node.inputs.as_slice() {
+        [x, b] => (x, b),
+        [_] | [] => return Err(operand(s, 1, OperandRefusal::Missing)),
+        [_, _, ..] => return Err(operand(s, 2, OperandRefusal::Extra)),
+    };
+    let TensorShape { rows, cols } = cx.graph.shape(s.node.output.tensor);
+    row_shape(s, rows, cols, BIAS_ADD_BF16_COLS)?;
+    same_shape(cx, s, 0, x, rows, cols)?;
+    same_shape(cx, s, 1, b, 1, cols)?;
+    whole_tensors(cx, s, &[(0, x), (1, b)])?;
+    let at = arena(cx)?;
+    let mut inputs = s.inputs.iter();
+    let xc = activation(cx, s, 0, inputs.next())?;
+    let bias = weight_operand(cx, s, 1, inputs.next())?;
+    Ok(BiasAddBf16 {
+        x: at(xc),
+        bias,
         out: at(colour_of(cx, s.writes)),
         rows,
         cols,
@@ -1372,11 +1400,14 @@ fn router_logits(
     })
 }
 
-/// The `MoeRoute` fold its `RouteTopK { k }` drives, as the one routing launch, in one of two
+/// The `MoeRoute` fold its `RouteTopK { k }` drives, as the one routing launch, in one of three
 /// programs:
 /// - Qwen's: the folded softmax (the fold's `pre`) over the `RouterLogits` it reads, its argsort
 ///   (the fold's `sort`), the top-k, the gathered scores and, when the fold took one as tail stage
 ///   1, their renorm;
+/// - GLM's: the folded `RouteSigmoidBias` (the fold's `pre`) over the `RouterLogits` it reads, its
+///   operand 1 the router's own bundle, whose f32 correction bias sits at `moe_bundle_biased`'s
+///   offset; then as Qwen's, the renorm at tail stage 1 when the fold took one;
 /// - Gemma's: no `pre`, the argsort and top-k over the raw logits, the gathered scores times the
 ///   `RouteScale` (tail stage 0), their softmax (stage 1), and the `RouteExpertScale` by the
 ///   router's per-expert scale (stage 2, its operand 2 a `[1, experts]` weight).
@@ -1403,11 +1434,21 @@ fn moe_route(
     // The step the logits are read through: the softmax (Qwen), else the argsort (Gemma).
     let (reader, program, renorm, expert_scale) = match (pre, tail) {
         (Some(pre), [None, renorm, None, None]) => {
-            let softmax = of(pre, |op| matches!(op, SubOp::RouteSoftmax)).ok_or_else(routing)?;
             if renorm.is_some_and(|r| of(r, |op| matches!(op, SubOp::RouteRenorm)).is_none()) {
                 return Err(routing());
             }
-            (softmax, RouteProgram::QwenSoftmax, renorm.is_some(), None)
+            let pre = at(pre).ok_or_else(routing)?;
+            let glm = SubOp::RouteSigmoidBias {
+                router: RouterBundle::SharedFused,
+            };
+            let program = if pre.node.op == SubOp::RouteSoftmax {
+                RouteProgram::QwenSoftmax
+            } else if pre.node.op == glm {
+                glm_route(cx, s, pre, computes)?
+            } else {
+                return Err(routing());
+            };
+            (pre, program, renorm.is_some(), None)
         }
         (None, [Some(scale), Some(softmax), Some(per_expert), None]) => {
             let scale = at(scale).ok_or_else(routing)?;
@@ -1457,6 +1498,38 @@ fn moe_route(
         renorm,
         program,
         expert_scale,
+    })
+}
+
+/// GLM's routing program for the `RouteSigmoidBias` `pre` its top-k `s` folds: the correction
+/// bias is operand 1 of `pre`, the same bundle the `RouterLogits` it reads (operand 0) projects
+/// with, at the aligned offset after the bundle's experts ([`moe_bundle_biased`] at the MoE
+/// scratch's geometry). A bias bound to any other weight is refused: the step reads it from the
+/// router's bundle.
+fn glm_route(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    pre: &TapeStep<'_>,
+    computes: &[TapeStep<'_>],
+) -> Result<RouteProgram, CanonicalRefusal> {
+    let routing = || moe_refusal(s, MoeShapeRule::Routing);
+    let [_, _] = pre.node.inputs.as_slice() else {
+        return Err(operand(pre, 1, OperandRefusal::Missing));
+    };
+    let bias = weight_operand(cx, pre, 1, pre.inputs.iter().nth(1))?;
+    let logits = moe_producer(cx, pre, 0, computes, |op| {
+        matches!(op, SubOp::RouterLogits { .. })
+    })?;
+    let router = weight_operand(cx, logits, 1, logits.inputs.iter().nth(1))?;
+    if bias != router {
+        return Err(routing());
+    }
+    let moe = moe_tape(cx, s)?;
+    let layout = moe_bundle_biased(moe.experts, moe.hidden, moe.inter)
+        .ok_or(moe_refusal(s, MoeShapeRule::Geometry))?;
+    Ok(RouteProgram::GlmSigmoidBias {
+        bias,
+        bias_offset: layout.bias,
     })
 }
 

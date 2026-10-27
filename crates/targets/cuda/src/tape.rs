@@ -13,11 +13,12 @@ use serde::Serialize;
 
 use crate::op_abi::CUDA_EXPERT_TILE_ROWS;
 use crate::step::{
-    ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep,
-    EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertSortBf16,
+    ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AttnPrefillBf16, BiasAddBf16, CUDA_KV_BLOCK_SIZE,
+    CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertSortBf16,
     GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES,
-    GatedDeltaNetBf16, GemmBf16, MoeRouteBf16, RmsNormBf16, RopeAppendBf16, RopeBf16,
-    RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch, sort_index_regions,
+    GatedDeltaNetBf16, GemmBf16, MoeRouteBf16, RmsNormBf16, RopeAppendBf16, RopeBf16, RouteProgram,
+    RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch, moe_bundle_biased,
+    sort_index_regions,
 };
 
 /// Bytes per activation element: CUDA's activations are bf16.
@@ -713,6 +714,22 @@ pub enum TapeError {
     /// The `step`-th step is not a MoE step (nor the `SiluMul` over the MoE gate and up rows) and
     /// reads or writes the MoE scratch.
     MoeScratchTouched { step: usize, span: ArenaSpan },
+    /// The `step`-th step is a bias add whose bias, weight `ix`, the tape declares as `declared`
+    /// bytes, not one `[cols]` bf16 row of `want` bytes.
+    BiasShape {
+        step: usize,
+        ix: u32,
+        declared: u64,
+        want: u64,
+    },
+    /// The `step`-th step is GLM's routing, and its correction bias is at `offset` bytes into its
+    /// bundle, not at the aligned offset `want` after the bundle's experts that the tape's MoE
+    /// geometry places it at (`step::moe_bundle_biased`; `None` when that overflows).
+    RouteBiasOffset {
+        step: usize,
+        offset: u64,
+        want: Option<u64>,
+    },
 }
 
 impl std::fmt::Display for TapeError {
@@ -1050,6 +1067,34 @@ impl std::fmt::Display for TapeError {
                      MoE scratch"
                 )
             }
+            Self::BiasShape {
+                step,
+                ix,
+                declared,
+                want,
+            } => write!(
+                f,
+                "step {step} adds weight {ix} as a bias, which the tape declares as {declared} \
+                 bytes; one [cols] bf16 row is {want}"
+            ),
+            Self::RouteBiasOffset {
+                step,
+                offset,
+                want: Some(want),
+            } => write!(
+                f,
+                "step {step} reads its routing's correction bias at byte {offset} of its bundle; \
+                 the tape's MoE geometry places it at {want}"
+            ),
+            Self::RouteBiasOffset {
+                step,
+                offset,
+                want: None,
+            } => write!(
+                f,
+                "step {step} reads its routing's correction bias at byte {offset} of its bundle; \
+                 the tape's MoE geometry overflows u64"
+            ),
         }
     }
 }
@@ -1590,6 +1635,20 @@ impl CudaTape {
                 Ok(())
             }
             CudaStep::Gemv(_) => self.one_row(step, s),
+            // The bias is exactly one `[cols]` bf16 row, as the step broadcasts it.
+            CudaStep::BiasAdd(BiasAddBf16 { bias, cols, .. }) => {
+                let want = u64::from(cols) * CUDA_ACT_BYTES;
+                match self.weight_bytes.get(bias.0 as usize) {
+                    Some(&declared) if declared != want => Err(TapeError::BiasShape {
+                        step,
+                        ix: bias.0,
+                        declared,
+                        want,
+                    }),
+                    // An index the tape lacks is `WeightIndex`, checked with every step's weight.
+                    Some(_) | None => Ok(()),
+                }
+            }
             // Gemma's router norm writes the scratch's router-norm region, whole.
             CudaStep::RouterNorm(RmsNormBf16 { y, rows, cols, .. }) => match self.moe {
                 Some(moe)
@@ -1783,10 +1842,22 @@ impl CudaTape {
                 m,
                 experts,
                 top_k,
+                program,
                 ..
             }) => {
                 if (m, experts, top_k) != (self.bucket_m, moe.experts, moe.top_k) {
                     return Err(geometry);
+                }
+                if let RouteProgram::GlmSigmoidBias { bias_offset, .. } = program {
+                    let want =
+                        moe_bundle_biased(moe.experts, moe.hidden, moe.inter).map(|b| b.bias);
+                    if want != Some(bias_offset) {
+                        return Err(TapeError::RouteBiasOffset {
+                            step,
+                            offset: bias_offset,
+                            want,
+                        });
+                    }
                 }
                 want(Region::MoeLogits, logits, moe.logits)?;
                 want(Region::MoeTopKIdx, topk_idx, moe.topk_idx)?;
@@ -3451,6 +3522,22 @@ mod tests {
                 tape: s,
             },
             TapeError::MoeScratchTouched { step: 1, span: s },
+            TapeError::BiasShape {
+                step: 1,
+                ix: 2,
+                declared: 4,
+                want: 8,
+            },
+            TapeError::RouteBiasOffset {
+                step: 1,
+                offset: 4,
+                want: Some(256),
+            },
+            TapeError::RouteBiasOffset {
+                step: 1,
+                offset: 4,
+                want: None,
+            },
         ];
         for e in &all {
             match e {
@@ -3495,7 +3582,9 @@ mod tests {
                 | TapeError::MoeRegionShape { .. }
                 | TapeError::MoeStepGeometry { .. }
                 | TapeError::MoeRegionMismatch { .. }
-                | TapeError::MoeScratchTouched { .. } => {}
+                | TapeError::MoeScratchTouched { .. }
+                | TapeError::BiasShape { .. }
+                | TapeError::RouteBiasOffset { .. } => {}
             }
         }
         all
@@ -3888,9 +3977,9 @@ mod tests {
                 },
             ),
             (
-                "head dim 128",
+                "head dim 192",
                 KvTape {
-                    classes: one(class(4, 128, None)),
+                    classes: one(class(2, 192, None)),
                     ..KV
                 },
             ),
