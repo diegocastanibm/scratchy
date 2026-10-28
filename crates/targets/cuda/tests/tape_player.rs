@@ -4649,3 +4649,135 @@ fn a_glm_append_at_head_dim_128_is_not_launched() {
         "RopeAppend",
     );
 }
+
+// ── GLM-4.5-Air's affine 4-bit steps are refused up front (#948) ───
+
+use common::glm_moe::{
+    GLM_AFFINE_FACTS, GROUP, glm_affine_chain, glm_affine_embed_facts, glm_moe_affine,
+};
+
+/// [`assert_not_launched`] over a token-id tape: its forward takes token ids, all 0, and the step
+/// refused is named before any copy, the arena's result untouched.
+fn assert_not_launched_ids(tape: CudaTape, is: fn(&CudaStep) -> bool, op: &str) {
+    let device = h100();
+    let step = (tape.steps.iter())
+        .position(is)
+        .expect("the tape holds the step");
+    let table: Vec<DeviceBuffer> = (tape.weight_bytes.iter())
+        .map(|&b| match b {
+            0 => DeviceBuffer::empty(),
+            b => DeviceBuffer::upload_bytes(&device, &vec![0u8; b as usize]).expect("upload"),
+        })
+        .collect();
+    let table: &'static [DeviceBuffer] = Box::leak(table.into_boxed_slice());
+    let tapes: &'static [CudaTape] = Box::leak(Box::new([tape]));
+    let mut worker = CudaWorker::new(&device, tapes, table, None, None).expect("worker");
+    let ids = vec![0u32; tape.bucket_m as usize];
+    let result = tape.result;
+    let mut y = vec![0xBEEFu16; result.bytes as usize / 2];
+    let before = read(&mut worker, result);
+    let e = worker
+        .forward(0, Input::TokenIds(&ids), &[], None, None, &mut y)
+        .expect_err("a step with no kernel is not launched");
+    eprintln!("glm affine {op}, step {step}: {e}");
+    assert!(
+        matches!(e, ForwardError::NotLaunched { step: s, op: o } if s == step && o == op),
+        "{e:?}"
+    );
+    assert!(y.iter().all(|&v| v == 0xBEEF), "the result is untouched");
+    assert_eq!(read(&mut worker, result), before, "nothing was enqueued");
+}
+
+/// A GLM-shaped affine chain with a token-id head is refused at its first step, the `AffineEmbed`,
+/// before anything is uploaded or enqueued: the affine embed has no kernel yet (#949).
+#[test]
+fn affine_glm_chain_is_not_launched_at_its_affine_embed() {
+    let tape = glm_tape(&glm_affine_chain(1, 4, GROUP), glm_affine_embed_facts(1024));
+    assert!(matches!(tape.steps.first(), Some(CudaStep::AffineEmbed(_))));
+    assert_not_launched_ids(
+        tape,
+        |s| matches!(s, CudaStep::AffineEmbed(_)),
+        "AffineEmbed",
+    );
+}
+
+/// The affine chain at one row, its input the embedded hidden, is refused at its first
+/// `AffineGemv` (#949).
+#[test]
+fn affine_gemv_is_not_launched() {
+    assert_not_launched(
+        glm_tape(&glm_affine_chain(1, 4, GROUP), GLM_AFFINE_FACTS),
+        |s| matches!(s, CudaStep::AffineGemv(_)),
+        "AffineGemv",
+    );
+}
+
+/// The affine chain at 128 rows is refused at its first `AffineGemm` (n = 512, #949).
+#[test]
+fn affine_gemm_is_not_launched() {
+    assert_not_launched(
+        glm_tape(&glm_affine_chain(128, 4, GROUP), GLM_AFFINE_FACTS),
+        |s| matches!(s, CudaStep::AffineGemm(_)),
+        "AffineGemm",
+    );
+}
+
+/// The affine chain at 128 rows from its second step on (n = 384, the 64-column GEMM's) is refused
+/// at its `AffineGemmCol64` (#949).
+#[test]
+fn affine_gemm_col64_is_not_launched() {
+    let tape = glm_tape(&glm_affine_chain(128, 4, GROUP), GLM_AFFINE_FACTS);
+    let first = tape
+        .steps
+        .iter()
+        .position(|s| matches!(s, CudaStep::AffineGemmCol64(_)));
+    let tape = CudaTape {
+        steps: &tape.steps[first.expect("a 64-column affine GEMM")..],
+        ..tape
+    };
+    assert_not_launched(
+        tape,
+        |s| matches!(s, CudaStep::AffineGemmCol64(_)),
+        "AffineGemmCol64",
+    );
+}
+
+/// GLM's affine MoE block at 512 rows, from its first affine expert step on, is refused at its
+/// `ExpertGemmAffine` (#950).
+#[test]
+fn expert_gemm_affine_is_not_launched() {
+    let tape = glm_tape(&glm_moe_affine(512, 4, GROUP), GLM_AFFINE_FACTS);
+    let first = tape
+        .steps
+        .iter()
+        .position(|s| matches!(s, CudaStep::ExpertGemmAffine(_)));
+    let tape = CudaTape {
+        steps: &tape.steps[first.expect("an affine expert GEMM")..],
+        ..tape
+    };
+    assert_not_launched(
+        tape,
+        |s| matches!(s, CudaStep::ExpertGemmAffine(_)),
+        "ExpertGemmAffine",
+    );
+}
+
+/// GLM's affine MoE block at one row, from its first affine expert step on, is refused at its
+/// `ExpertGemvAffine` (#950).
+#[test]
+fn expert_gemv_affine_is_not_launched() {
+    let tape = glm_tape(&glm_moe_affine(1, 4, GROUP), GLM_AFFINE_FACTS);
+    let first = tape
+        .steps
+        .iter()
+        .position(|s| matches!(s, CudaStep::ExpertGemvAffine(_)));
+    let tape = CudaTape {
+        steps: &tape.steps[first.expect("an affine expert GEMV")..],
+        ..tape
+    };
+    assert_not_launched(
+        tape,
+        |s| matches!(s, CudaStep::ExpertGemvAffine(_)),
+        "ExpertGemvAffine",
+    );
+}

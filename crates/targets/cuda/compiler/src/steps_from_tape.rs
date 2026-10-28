@@ -22,28 +22,31 @@ use scratchy_subtile::subtile_ir::{TensorRegion, TensorShape};
 use scratchy_subtile::subtile_tape::{ComputeInput, ComputeInputs, SlotId};
 use scratchy_subtile::tape_colouring::{Colour, TapeColouring};
 use scratchy_subtile::tape_folding::{FusedShape, Fusion};
-use scratchy_target_cuda::op_abi::{CUDA_GROUPED_EXPERTS, CudaFusion, MOE_EXPERT_COUNTS};
+use scratchy_target_cuda::op_abi::{
+    CUDA_AFFINE_FORMS, CUDA_GROUPED_EXPERTS, CudaFusion, MOE_EXPERT_COUNTS,
+};
 use scratchy_target_cuda::step::{
     ADD_BF16_COLS, ATTN_BF16_HEAD_DIMS, ATTN_DECODE_BF16_MAX_GROUP, ATTN_PREFILL_BF16_ROWS,
-    ATTN_WINDOW_MULTIPLE, AddBf16, AttnPrefillBf16, BIAS_ADD_BF16_COLS, BiasAddBf16, CudaStep,
-    EMBED_BF16_COLS, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16,
-    ExpertProjection, ExpertSortBf16, GATE_APPLY_BF16_COLS, GATE_SCALE_BF16_COLS,
-    GATE_SPLIT_BF16_HEAD_DIM, GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K,
-    GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_COL64_TILE, GEMM_NARROW_BF16_MAX_N,
+    ATTN_WINDOW_MULTIPLE, AddBf16, AffineEmbedBf16, AffineGemmBf16, AttnPrefillBf16,
+    BIAS_ADD_BF16_COLS, BiasAddBf16, CudaStep, EMBED_BF16_COLS, EmbedBf16, ExpertCombineBf16,
+    ExpertGemmAffineBf16, ExpertGemmBf16, ExpertGemvAffineBf16, ExpertGemvBf16, ExpertProjection,
+    ExpertSortBf16, GATE_APPLY_BF16_COLS, GATE_SCALE_BF16_COLS, GATE_SPLIT_BF16_HEAD_DIM,
+    GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX,
+    GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_COL64_TILE, GEMM_NARROW_BF16_MAX_N,
     GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16,
     GateScaleBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K,
     MatmulKernel, MoeRouteBf16, MoeWeight, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE,
     ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
     RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16,
-    SiluMulBf16, SoftCapBf16, moe_bundle_biased,
+    SiluMulBf16, SoftCapBf16, moe_bundle_affine, moe_bundle_biased,
 };
 use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
 use crate::canonical::{
-    ArenaRefusal, AttnShapeRule, CanonicalRefusal, CudaAttnClass, CudaModelFacts, EmbedShapeRule,
-    GateShapeRule, GdnRegions, GdnShapeRule, GdnWidths, GemmColTile, GemmShapeRule, KvCacheRefusal,
-    KvPool, KvRegions, MoeShapeRule, OperandRefusal, ProducerRefusal, RopeShapeRule, RowShapeRule,
-    SharedExpertOwner, ViewRefusal,
+    ArenaRefusal, AttnShapeRule, CanonicalRefusal, CudaAffine, CudaAttnClass, CudaModelFacts,
+    EmbedShapeRule, GateShapeRule, GdnRegions, GdnShapeRule, GdnWidths, GemmColTile, GemmShapeRule,
+    GemmWeightRule, KvCacheRefusal, KvPool, KvRegions, MoeShapeRule, OperandRefusal,
+    ProducerRefusal, RopeShapeRule, RowShapeRule, SharedExpertOwner, ViewRefusal,
 };
 
 /// What a step's lowering reads besides the step itself: the planned canonical, the model facts,
@@ -198,12 +201,15 @@ pub fn lower_step(
 /// The head's embed: `out [rows, hidden]` (colour 0, the embedded hidden) gathered from the
 /// `[vocab, hidden]` bf16 `table` by the `rows` u32 token ids at `tokens`. Not lowered from a tape
 /// op: the shared tape's first ops read the embedded hidden as a source, which this step fills.
-/// The shape rule is the launcher's ([`EMBED_BF16_COLS`]), stated at expansion.
+/// The shape rule is the launcher's ([`EMBED_BF16_COLS`]), stated at expansion. Under
+/// [`CudaAffine::Lower`] with an affine table (the handoff's `embed_affine`) it is the affine
+/// embed of the table's group instead, of a form `op_abi::CUDA_AFFINE_FORMS` names.
 pub fn embed(
     tokens: ArenaOffset,
     table: WeightIx,
     out: ArenaOffset,
     (rows, hidden, vocab): (u32, u32, u32),
+    affine: CudaAffine,
 ) -> Result<CudaStep, CanonicalRefusal> {
     let refuse = |rule| CanonicalRefusal::EmbedShape {
         rows,
@@ -227,6 +233,26 @@ pub fn embed(
     let elements = u64::from(rows) * u64::from(hidden);
     if elements > i32::MAX as u64 {
         return Err(refuse(EmbedShapeRule::TooManyElements { elements }));
+    }
+    match affine {
+        CudaAffine::Lower {
+            embed: Some((bits, group)),
+            ..
+        } => {
+            if !CUDA_AFFINE_FORMS.contains(&(bits, group)) || !hidden.is_multiple_of(group) {
+                return Err(refuse(EmbedShapeRule::AffineForm { bits, group }));
+            }
+            return Ok(CudaStep::AffineEmbed(AffineEmbedBf16 {
+                tokens,
+                table,
+                out,
+                rows,
+                hidden,
+                vocab,
+                group,
+            }));
+        }
+        CudaAffine::Lower { embed: None, .. } | CudaAffine::Refuse => {}
     }
     Ok(CudaStep::Embed(EmbedBf16 {
         tokens,
@@ -284,12 +310,33 @@ fn gemm(
             rule,
         }
     })?;
-    if !matches!(weight, GemmWeight::Dense) {
-        return Err(CanonicalRefusal::GemmWeight {
-            step,
-            weight: weight.kind(),
-        });
-    }
+    // The affine step whose bf16 twin `kernel` is, at the weight's group; `None` for dense.
+    let affine = match (weight, cx.facts.affine) {
+        (GemmWeight::Dense, _) => None,
+        (GemmWeight::Affine { affine }, CudaAffine::Lower { .. }) => {
+            let (bits, group) = (affine.bits().get(), affine.group().get());
+            let refuse = |rule| CanonicalRefusal::AffineGemm {
+                step,
+                m,
+                n,
+                k,
+                rule,
+            };
+            if !CUDA_AFFINE_FORMS.contains(&(bits, group)) {
+                return Err(refuse(GemmWeightRule::AffineForm { bits, group }));
+            }
+            let twin = kernel
+                .affine()
+                .ok_or(refuse(GemmWeightRule::AffineNarrow))?;
+            Some((twin, group))
+        }
+        (GemmWeight::Affine { .. }, CudaAffine::Refuse) | (GemmWeight::Fp8Dynamic, _) => {
+            return Err(CanonicalRefusal::GemmWeight {
+                step,
+                weight: weight.kind(),
+            });
+        }
+    };
     whole_tensors(cx, s, &[(0, act), (1, wt)])?;
     let at = arena(cx)?;
     let mut inputs = s.inputs.iter();
@@ -303,7 +350,50 @@ fn gemm(
         n,
         k,
     };
-    Ok(kernel(gemm))
+    Ok(match affine {
+        Some((twin, group)) => twin(AffineGemmBf16 {
+            a: gemm.a,
+            b,
+            c: gemm.c,
+            m,
+            n,
+            k,
+            group,
+        }),
+        None => kernel.bf16()(gemm),
+    })
+}
+
+/// Which bf16 GEMM [`gemm_kernel`] chose for a shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GemmKernel {
+    Narrow,
+    Col64,
+    Gemv,
+    Tiled,
+}
+
+impl GemmKernel {
+    /// The bf16 step.
+    fn bf16(self) -> fn(GemmBf16) -> CudaStep {
+        match self {
+            Self::Narrow => CudaStep::GemmNarrow,
+            Self::Col64 => CudaStep::GemmCol64,
+            Self::Gemv => CudaStep::Gemv,
+            Self::Tiled => CudaStep::Gemm,
+        }
+    }
+
+    /// The affine step whose bf16 twin this is. `None` for the narrow GEMM, which has no affine
+    /// counterpart (GLM has no affine `n` of 64 or less: its router stays dense).
+    fn affine(self) -> Option<fn(AffineGemmBf16) -> CudaStep> {
+        match self {
+            Self::Narrow => None,
+            Self::Col64 => Some(CudaStep::AffineGemmCol64),
+            Self::Gemv => Some(CudaStep::AffineGemv),
+            Self::Tiled => Some(CudaStep::AffineGemm),
+        }
+    }
 }
 
 /// `RmsNorm { eps, gain }` as the bf16 RMSNorm: `x` (operand 0) a computed slot or the embedded
@@ -1310,6 +1400,28 @@ fn moe_counts(
     Ok(())
 }
 
+/// The `(bits, group)` of the affine bank the router `s` projects with: an affine `ExpertMatmul`
+/// that reads the router's own bundle (operand 2 is the router's operand 1); `None` when the
+/// bundle's experts are dense. A router of an affine bundle reads it at byte 0, as a dense one.
+fn bank_of(computes: &[TapeStep<'_>], s: &TapeStep<'_>) -> Option<(u32, u32)> {
+    let bundle = |t: &TapeStep<'_>, k: usize| match t.inputs.iter().nth(k) {
+        Some(ComputeInput::External { tensor, .. }) => Some(tensor.index()),
+        Some(ComputeInput::Computed(_)) | None => None,
+    };
+    let router = bundle(s, 1)?;
+    computes.iter().find_map(|c| {
+        if let SubOp::ExpertMatmul {
+            weight: ExpertWeight::Affine(q),
+            ..
+        } = c.node.op
+            && bundle(c, 2) == Some(router)
+        {
+            return Some((q.bits().get(), q.group().get()));
+        }
+        None
+    })
+}
+
 /// The expert bundle of a router, and the buffer its weight is: Qwen's shared-fused router reads
 /// its bundle, Gemma's its own projection beside the SwitchGLU bank. `None` for a router CUDA has
 /// no MoE step for.
@@ -1343,6 +1455,17 @@ fn router_logits(
     let (x, w) = match node.inputs.as_slice() {
         [x, w] => (x, w),
         _ => return Err(operand(s, 1, OperandRefusal::Missing)),
+    };
+    // An affine bundle's router: dense at byte 0 of the bank, or refused when the checkpoint
+    // ships it quantized (CUDA has no affine router kernel).
+    let weight = match (weight, bank_of(computes, s)) {
+        (MoeWeight::Bundle, Some(_)) => match cx.facts.affine {
+            CudaAffine::Lower {
+                router: Some(bits), ..
+            } => return Err(moe_refusal(s, MoeShapeRule::AffineRouter { bits })),
+            CudaAffine::Lower { router: None, .. } | CudaAffine::Refuse => MoeWeight::AffineBank,
+        },
+        (weight, _) => weight,
     };
     let moe = moe_tape(cx, s)?;
     moe_counts(cx, s, &moe, (experts, moe.top_k))?;
@@ -1525,12 +1648,16 @@ fn glm_route(
         return Err(routing());
     }
     let moe = moe_tape(cx, s)?;
-    let layout = moe_bundle_biased(moe.experts, moe.hidden, moe.inter)
-        .ok_or(moe_refusal(s, MoeShapeRule::Geometry))?;
-    Ok(RouteProgram::GlmSigmoidBias {
-        bias,
-        bias_offset: layout.bias,
-    })
+    // The bias's slab of an affine bundle (its experts' group), else after a dense bundle's
+    // experts.
+    let bias_offset = match bank_of(computes, logits) {
+        Some((_, group)) => {
+            moe_bundle_affine(moe.experts, moe.hidden, moe.inter, group).map(|b| b.correction_bias)
+        }
+        None => moe_bundle_biased(moe.experts, moe.hidden, moe.inter).map(|b| b.bias),
+    }
+    .ok_or(moe_refusal(s, MoeShapeRule::Geometry))?;
+    Ok(RouteProgram::GlmSigmoidBias { bias, bias_offset })
 }
 
 /// `RouterNorm { eps, router }` as the bf16 RMSNorm of Gemma's router input into the MoE
@@ -1655,19 +1782,32 @@ fn expert_matmul(
     (weight, bundle): (ExpertWeight, ExpertBundle),
     computes: &[TapeStep<'_>],
 ) -> Result<CudaStep, CanonicalRefusal> {
-    if let ExpertWeight::Affine(_) = weight {
-        return Err(moe_refusal(s, MoeShapeRule::Affine));
-    }
+    // An affine bank's group, under `CudaAffine::Lower` at a form CUDA takes; `None` for dense.
+    let group = match (weight, cx.facts.affine) {
+        (ExpertWeight::Dense, _) => None,
+        (ExpertWeight::Affine(q), CudaAffine::Lower { .. }) => {
+            let (bits, group) = (q.bits().get(), q.group().get());
+            if !CUDA_AFFINE_FORMS.contains(&(bits, group)) {
+                return Err(moe_refusal(s, MoeShapeRule::AffineForm { bits, group }));
+            }
+            Some(group)
+        }
+        (ExpertWeight::Affine(_), CudaAffine::Refuse) => {
+            return Err(moe_refusal(s, MoeShapeRule::Affine));
+        }
+    };
     let sort_op = |op: &SubOp| matches!(op, SubOp::ExpertSort { .. });
     let sort = moe_producer(cx, s, 1, computes, sort_op)?;
     let SubOp::ExpertSort { experts, .. } = sort.node.op else {
         return Err(moe_refusal(s, MoeShapeRule::Routing));
     };
     let moe = expert_bundle(cx, s, bundle, (experts.get(), top_k))?;
-    // Gemma's SwitchGLU bank is its own expert bank, with no router in it.
-    let layout = match bundle {
-        ExpertBundle::SwitchGlu => MoeWeight::Own,
-        _ => MoeWeight::Bundle,
+    // Gemma's SwitchGLU bank is its own expert bank, with no router in it; an affine bank is
+    // GLM's MLX bundle, router included.
+    let layout = match (bundle, group) {
+        (_, Some(_)) => MoeWeight::AffineBank,
+        (ExpertBundle::SwitchGlu, None) => MoeWeight::Own,
+        (_, None) => MoeWeight::Bundle,
     };
     let (projection, reads) = match proj {
         ExpertProj::Gate => (ExpertProjection::Gate, PairRows::Token),
@@ -1684,8 +1824,23 @@ fn expert_matmul(
             matches!(op, SubOp::ExpertGatedAct { .. })
         })?,
     };
-    let [_, _, w] = s.node.inputs.as_slice() else {
-        return Err(operand(s, 3, OperandRefusal::Extra));
+    // A dense bank's matmul binds its weight alone (operand 2); an affine bank's its weight and
+    // its scale (operand 3), which the bridge binds to the same bundle: the scales resolve by
+    // tensor role inside it.
+    let w = match (s.node.inputs.as_slice(), group) {
+        ([_, _, w], None) => w,
+        ([_, _, w, sc], Some(_)) => {
+            whole_tensors(cx, s, &[(3, sc)])?;
+            let scale = weight_operand(cx, s, 3, s.inputs.iter().nth(3))?;
+            if Some(scale) != weight_operand(cx, s, 2, s.inputs.iter().nth(2)).ok() {
+                return Err(moe_refusal(s, MoeShapeRule::Bundle));
+            }
+            w
+        }
+        ([_, _, _, ..], None) => return Err(operand(s, 3, OperandRefusal::Extra)),
+        ([_, _, _, _, ..], Some(_)) => return Err(operand(s, 4, OperandRefusal::Extra)),
+        (_, None) => return Err(operand(s, 2, OperandRefusal::Missing)),
+        (_, Some(_)) => return Err(operand(s, 3, OperandRefusal::Missing)),
     };
     whole_tensors(cx, s, &[(2, w)])?;
     let bundle = weight_operand(cx, s, 2, s.inputs.iter().nth(2))?;
@@ -1703,7 +1858,7 @@ fn expert_matmul(
             }
             PairRows::Pair => moe.act.offset,
         };
-        return Ok(CudaStep::ExpertGemv(ExpertGemvBf16 {
+        let gemv = ExpertGemvBf16 {
             a,
             rows: reads,
             bundle,
@@ -1716,7 +1871,25 @@ fn expert_matmul(
             experts: moe.experts,
             hidden: moe.hidden,
             inter: moe.inter,
-        }));
+        };
+        return Ok(match group {
+            Some(group) => CudaStep::ExpertGemvAffine(ExpertGemvAffineBf16 {
+                a: gemv.a,
+                rows: gemv.rows,
+                bundle: gemv.bundle,
+                weight: gemv.weight,
+                proj: gemv.proj,
+                topk_idx: gemv.topk_idx,
+                c: gemv.c,
+                m: gemv.m,
+                top_k: gemv.top_k,
+                experts: gemv.experts,
+                hidden: gemv.hidden,
+                inter: gemv.inter,
+                group,
+            }),
+            None => CudaStep::ExpertGemv(gemv),
+        });
     };
     let (_, tn, tk) = GEMM_BF16_TILE;
     // A 64-column-tile model's expert GEMM takes 64-column tiles when `n` is off the 256 one.
@@ -1733,7 +1906,7 @@ fn expert_matmul(
         PairRows::Token => sorted.rows.offset,
         PairRows::Pair => moe.act.offset,
     };
-    Ok(CudaStep::ExpertGemm(ExpertGemmBf16 {
+    let gemm = ExpertGemmBf16 {
         a,
         bundle,
         weight: layout,
@@ -1746,7 +1919,25 @@ fn expert_matmul(
         hidden: moe.hidden,
         inter: moe.inter,
         n_tile: tn,
-    }))
+    };
+    Ok(match group {
+        Some(group) => CudaStep::ExpertGemmAffine(ExpertGemmAffineBf16 {
+            a: gemm.a,
+            bundle: gemm.bundle,
+            weight: gemm.weight,
+            proj: gemm.proj,
+            offsets: gemm.offsets,
+            tile_expert: gemm.tile_expert,
+            c: gemm.c,
+            max_tiles: gemm.max_tiles,
+            experts: gemm.experts,
+            hidden: gemm.hidden,
+            inter: gemm.inter,
+            n_tile: gemm.n_tile,
+            group,
+        }),
+        None => CudaStep::ExpertGemm(gemm),
+    })
 }
 
 /// `ExpertGatedAct { act }` as the bf16 `SiluMul` (Qwen's SiLU) or `GeluMul` (Gemma's GELU) over
@@ -1962,15 +2153,10 @@ fn gate_shape(rows: u32, half_cols: u32, head_dim: u32) -> Result<(), GateShapeR
 /// more and an `n` that is a multiple of 64 and not of 256 goes to the 64-column GEMM under its
 /// rule ([`gemm_col64_shape`]); otherwise `m = 1` goes to the GEMV under its rule
 /// ([`gemv_shape`]), and any other `m` to the tiled GEMM under its rule ([`gemm_shape`]).
-fn gemm_kernel(
-    m: u32,
-    n: u32,
-    k: u32,
-    col_tile: GemmColTile,
-) -> Result<fn(GemmBf16) -> CudaStep, GemmShapeRule> {
+fn gemm_kernel(m: u32, n: u32, k: u32, col_tile: GemmColTile) -> Result<GemmKernel, GemmShapeRule> {
     if n != 0 && n <= GEMM_NARROW_BF16_MAX_N && !n.is_multiple_of(GEMM_BF16_TILE.1) {
         gemm_narrow_shape(m, n, k)?;
-        return Ok(CudaStep::GemmNarrow);
+        return Ok(GemmKernel::Narrow);
     }
     if col_tile == GemmColTile::Col64
         && m >= 2
@@ -1979,14 +2165,14 @@ fn gemm_kernel(
         && !n.is_multiple_of(GEMM_BF16_TILE.1)
     {
         gemm_col64_shape(m, n, k)?;
-        return Ok(CudaStep::GemmCol64);
+        return Ok(GemmKernel::Col64);
     }
     if m == 1 {
         gemv_shape(n, k)?;
-        return Ok(CudaStep::Gemv);
+        return Ok(GemmKernel::Gemv);
     }
     gemm_shape(m, n, k)?;
-    Ok(CudaStep::Gemm)
+    Ok(GemmKernel::Tiled)
 }
 
 /// The bf16 GEMV's shape rule (`m = 1`, which the caller chose it by): `n` non-zero, `k` a

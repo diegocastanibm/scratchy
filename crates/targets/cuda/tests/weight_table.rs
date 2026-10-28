@@ -741,3 +741,405 @@ fn a_gemma_expert_bank_of_another_shape_is_refused() {
         "{e}"
     );
 }
+
+// ── MLX-affine weights (#948) ──────────────────────────────────────
+
+use scratchy_target_cuda::step::{affine_weight, moe_bundle_affine};
+use scratchy_target_cuda::weights::{AffineTensors, ScaleLayout};
+
+/// The affine fixtures' geometry, GLM-shaped and small: 4 experts, hidden 128, expert width 64,
+/// group 64. An affine `[n, k]` weight of `n` = 96 rows (no multiple of 256 bytes of scales: the
+/// layout's padding is exercised).
+const AFF_E: u32 = 4;
+const AFF_H: u32 = 128;
+const AFF_I: u32 = 64;
+const AFF_G: u32 = 64;
+const AFF_N: u32 = 96;
+
+/// One affine projection's HF-layout MLX tensors, `[.., rows, k]`: the packed `[.., rows, k/8]`
+/// u32 codes and the `[.., rows, k/group]` bf16 scales and biases, each value distinct so a
+/// misplaced byte shows. `seed` separates projections.
+fn mlx(lead: &[usize], k: usize, seed: u32) -> [(Dtype, Vec<usize>, Vec<u8>); 3] {
+    let count: usize = lead.iter().product();
+    let groups = k / AFF_G as usize;
+    let shape = |last: usize| lead.iter().copied().chain([last]).collect::<Vec<_>>();
+    let codes: Vec<u8> = (0..count * k / 8)
+        .flat_map(|w| (seed.wrapping_mul(0x9E37_79B9) ^ w as u32).to_le_bytes())
+        .collect();
+    let bf16s = |base: u16| -> Vec<u8> {
+        (0..count * groups)
+            .flat_map(|i| (base.wrapping_add(i as u16) & 0x3FFF | 0x0400).to_le_bytes())
+            .collect()
+    };
+    [
+        (Dtype::U32, shape(k / 8), codes),
+        (
+            Dtype::BF16,
+            shape(groups),
+            bf16s(0x1000 + seed as u16 * 0x100),
+        ),
+        (
+            Dtype::BF16,
+            shape(groups),
+            bf16s(0x2000 + seed as u16 * 0x100),
+        ),
+    ]
+}
+
+/// `[blocks, n, groups]` bf16 bytes as `[blocks, groups, n]`, written independently of the
+/// loader's `group_major`: by output position, reading its source element.
+fn transposed(src: &[u8], blocks: usize, n: usize, groups: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len());
+    for b in 0..blocks {
+        for g in 0..groups {
+            for r in 0..n {
+                let at = ((b * n + r) * groups + g) * 2;
+                out.extend_from_slice(&src[at..at + 2]);
+            }
+        }
+    }
+    out
+}
+
+/// A checkpoint of `tensors` (name after `root`, dtype, shape, bytes) in a fresh `dir`.
+fn tensors_dir(
+    name: &str,
+    root: &str,
+    tensors: &[(String, Dtype, Vec<usize>, Vec<u8>)],
+) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("weight_table_{name}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("make the checkpoint dir");
+    let views: Vec<(String, TensorView<'_>)> = (tensors.iter())
+        .map(|(n, dtype, shape, bytes)| {
+            let view = TensorView::new(*dtype, shape.clone(), bytes).expect("a tensor view");
+            (format!("{root}.{n}"), view)
+        })
+        .collect();
+    let bytes = safetensors::serialize(views, None).expect("serialize the checkpoint");
+    std::fs::write(dir.join("model.safetensors"), bytes).expect("write the checkpoint");
+    dir
+}
+
+use std::path::PathBuf;
+
+/// The affine `[n, k]` weight's three tensors under `{root}.layers.0.self_attn.q_proj`.
+fn affine_tensors() -> Vec<(String, Dtype, Vec<usize>, Vec<u8>)> {
+    let [w, s, b] = mlx(&[AFF_N as usize], AFF_H as usize, 7);
+    let p = "layers.0.self_attn.q_proj";
+    vec![
+        (format!("{p}.weight"), w.0, w.1, w.2),
+        (format!("{p}.scales"), s.0, s.1, s.2),
+        (format!("{p}.biases"), b.0, b.1, b.2),
+    ]
+}
+
+/// The affine entry over [`affine_tensors`] in `layout`.
+fn affine_entry(layout: ScaleLayout) -> CudaWeight {
+    CudaWeight::Affine {
+        weight: "language_model.model.layers.0.self_attn.q_proj.weight",
+        scales: "language_model.model.layers.0.self_attn.q_proj.scales",
+        biases: "language_model.model.layers.0.self_attn.q_proj.biases",
+        n: AFF_N,
+        k: AFF_H,
+        group: AFF_G,
+        layout,
+    }
+}
+
+/// An affine `[96, 128]` weight at group 64 staged byte for byte in both scale layouts, against an
+/// independently written expected buffer: the packed codes as on disk at byte 0, the scales and
+/// biases at `affine_weight`'s 256-aligned offsets, as on disk (row-major) or transposed to
+/// `[k/64, n]` (group-major), every padding byte 0; in both name orderings, and `check` accepts it.
+#[test]
+fn an_affine_weight_is_packed_exactly_in_both_layouts() {
+    let layout = affine_weight(AFF_N, AFF_H, AFF_G).expect("fits");
+    let packed = u64::from(AFF_N) * u64::from(AFF_H) / 2;
+    let per = u64::from(AFF_N) * u64::from(AFF_H / AFF_G) * 2;
+    assert_eq!(
+        (layout.weight, layout.scales, layout.biases, layout.bytes),
+        (
+            0,
+            packed,
+            packed + per.next_multiple_of(256),
+            packed + per.next_multiple_of(256) + per
+        ),
+        "the weight's regions"
+    );
+    let t = affine_tensors();
+    let (codes, scales, biases) = (&t[0].3, &t[1].3, &t[2].3);
+    let groups = (AFF_H / AFF_G) as usize;
+    for (scale_layout, order) in [
+        (ScaleLayout::RowMajor, false),
+        (ScaleLayout::GroupMajor, true),
+    ] {
+        let mut want = vec![0u8; layout.bytes as usize];
+        want[..codes.len()].copy_from_slice(codes);
+        for (src, at) in [(scales, layout.scales), (biases, layout.biases)] {
+            let bytes = match order {
+                true => transposed(src, 1, AFF_N as usize, groups),
+                false => src.clone(),
+            };
+            want[at as usize..][..bytes.len()].copy_from_slice(&bytes);
+        }
+        let entry = affine_entry(scale_layout);
+        assert_eq!(entry.packed_bytes(), Some(layout.bytes));
+        for root in ORDERINGS {
+            let dir = tensors_dir(&format!("affine_{scale_layout:?}_{root}"), root, &t);
+            let mut w = open_checkpoint(&dir).expect("open");
+            let staged = stage(0, &entry, &mut w).expect("stage the affine weight");
+            assert!(
+                staged == want,
+                "{root} {scale_layout:?}: the buffer's bytes"
+            );
+            let bytes: &'static [u64] = Box::leak(Box::new([layout.bytes]));
+            let w = open_checkpoint(&dir).expect("open");
+            check(&[Some(entry)], &[tape(bytes)], &w).unwrap_or_else(|e| panic!("{root}: {e}"));
+        }
+    }
+}
+
+/// The affine MoE bundle's 11 tensors under `{root}.layers.1.mlp`: the dense router `[E, H]`, the
+/// f32 correction bias `[E]`, and each `switch_mlp` projection's codes, scales and biases. `router`
+/// `scales: true` adds a `gate.scales` beside the router, as a quantized-router checkpoint ships.
+fn bundle_tensors(router_scales: bool) -> Vec<(String, Dtype, Vec<usize>, Vec<u8>)> {
+    let (e, h, i) = (AFF_E as usize, AFF_H as usize, AFF_I as usize);
+    let p = "layers.1.mlp";
+    let mut t = vec![
+        (
+            format!("{p}.gate.weight"),
+            Dtype::BF16,
+            vec![e, h],
+            (0..e * h)
+                .flat_map(|k| ((0x3000u16 + k as u16) & 0x3FFF | 0x0400).to_le_bytes())
+                .collect(),
+        ),
+        (
+            format!("{p}.gate.e_score_correction_bias"),
+            Dtype::F32,
+            vec![e],
+            (0..e)
+                .flat_map(|k| (k as f32 * 0.25 - 1.0).to_le_bytes())
+                .collect(),
+        ),
+    ];
+    for (proj, rows, k, seed) in [
+        ("gate_proj", i, h, 1),
+        ("up_proj", i, h, 2),
+        ("down_proj", h, i, 3),
+    ] {
+        let [w, s, b] = mlx(&[e, rows], k, seed);
+        t.push((format!("{p}.switch_mlp.{proj}.weight"), w.0, w.1, w.2));
+        t.push((format!("{p}.switch_mlp.{proj}.scales"), s.0, s.1, s.2));
+        t.push((format!("{p}.switch_mlp.{proj}.biases"), b.0, b.1, b.2));
+    }
+    if router_scales {
+        t.push((
+            format!("{p}.gate.scales"),
+            Dtype::BF16,
+            vec![e, h / AFF_G as usize],
+            vec![0; e * h / AFF_G as usize * 2],
+        ));
+    }
+    t
+}
+
+/// The affine MoE bundle entry over [`bundle_tensors`].
+fn bundle_entry() -> CudaWeight {
+    let p = "language_model.model.layers.1.mlp";
+    let proj = |name: &str| AffineTensors {
+        weight: Box::leak(format!("{p}.switch_mlp.{name}.weight").into_boxed_str()),
+        scales: Box::leak(format!("{p}.switch_mlp.{name}.scales").into_boxed_str()),
+        biases: Box::leak(format!("{p}.switch_mlp.{name}.biases").into_boxed_str()),
+    };
+    CudaWeight::MoeBundleAffine {
+        router: "language_model.model.layers.1.mlp.gate.weight",
+        correction_bias: "language_model.model.layers.1.mlp.gate.e_score_correction_bias",
+        gate: proj("gate_proj"),
+        up: proj("up_proj"),
+        down: proj("down_proj"),
+        experts: AFF_E,
+        hidden: AFF_H,
+        inter: AFF_I,
+        group: AFF_G,
+    }
+}
+
+/// The affine MoE bundle (E 4, H 128, I 64, group 64) staged byte for byte against an independently
+/// written expected layout, as `a_moe_bundle_is_packed_exactly`: the router at byte 0, the f32 bias
+/// at its 256-aligned slab, then the gate, up and down slabs (separate, as the checkpoint ships
+/// them), each its codes as on disk and its scales and biases group-major per expert (`[E, k/64,
+/// n]`), every slab 256-aligned and every padding byte 0; in both orderings, and `check` accepts it.
+#[test]
+fn an_affine_moe_bundle_is_packed_exactly() {
+    let layout = moe_bundle_affine(AFF_E, AFF_H, AFF_I, AFF_G).expect("fits");
+    let t = bundle_tensors(false);
+    let mut want = vec![0u8; layout.bytes as usize];
+    let mut at =
+        |offset: u64, bytes: &[u8]| want[offset as usize..][..bytes.len()].copy_from_slice(bytes);
+    at(layout.router, &t[0].3);
+    at(layout.correction_bias, &t[1].3);
+    let (e, h, i) = (AFF_E as usize, AFF_H as usize, AFF_I as usize);
+    for (k, (slab, n, kk)) in [(layout.gate, i, h), (layout.up, i, h), (layout.down, h, i)]
+        .into_iter()
+        .enumerate()
+    {
+        let groups = kk / AFF_G as usize;
+        let base = 2 + 3 * k;
+        assert!(slab.weight.is_multiple_of(256), "slab {k}'s codes");
+        assert!(slab.scales.is_multiple_of(256), "slab {k}'s scales");
+        assert!(slab.biases.is_multiple_of(256), "slab {k}'s biases");
+        at(slab.weight, &t[base].3);
+        at(slab.scales, &transposed(&t[base + 1].3, e, n, groups));
+        at(slab.biases, &transposed(&t[base + 2].3, e, n, groups));
+    }
+    let entry = bundle_entry();
+    assert_eq!(entry.packed_bytes(), Some(layout.bytes));
+    assert_eq!(
+        entry.lead(),
+        "language_model.model.layers.1.mlp.gate.weight"
+    );
+    for root in ORDERINGS {
+        let dir = tensors_dir(&format!("affine_bundle_{root}"), root, &t);
+        let mut w = open_checkpoint(&dir).expect("open");
+        let staged = stage(0, &entry, &mut w).expect("stage the bundle");
+        assert_eq!(
+            staged.len() as u64,
+            layout.bytes,
+            "{root}: the bundle's bytes"
+        );
+        assert!(staged == want, "{root}: the bundle's bytes, byte for byte");
+        let bytes: &'static [u64] = Box::leak(Box::new([layout.bytes]));
+        let w = open_checkpoint(&dir).expect("open");
+        check(&[Some(entry)], &[tape(bytes)], &w).unwrap_or_else(|e| panic!("{root}: {e}"));
+    }
+}
+
+/// `t` with tensor `name` (after the root) replaced by `f`'s, or removed when `f` gives `None`.
+fn edited(
+    t: Vec<(String, Dtype, Vec<usize>, Vec<u8>)>,
+    name: &str,
+    f: impl Fn(&(String, Dtype, Vec<usize>, Vec<u8>)) -> Option<(String, Dtype, Vec<usize>, Vec<u8>)>,
+) -> Vec<(String, Dtype, Vec<usize>, Vec<u8>)> {
+    t.into_iter()
+        .filter_map(|x| if x.0 == name { f(&x) } else { Some(x) })
+        .collect()
+}
+
+/// `entry`'s refusal against a checkpoint of `t`.
+fn affine_refusal(
+    name: &str,
+    entry: CudaWeight,
+    t: &[(String, Dtype, Vec<usize>, Vec<u8>)],
+) -> LoadError {
+    let w = open_checkpoint(&tensors_dir(name, ROOT, t)).expect("open");
+    let bytes: &'static [u64] = Box::leak(Box::new([entry.packed_bytes().expect("fits")]));
+    let e = check(&[Some(entry)], &[tape(bytes)], &w).expect_err("the entry is refused");
+    eprintln!("{name}: {e}");
+    e
+}
+
+/// A missing `.scales` is refused as `Missing`, naming it.
+#[test]
+fn an_affine_weight_with_no_scales_is_refused_by_name() {
+    let t = edited(affine_tensors(), "layers.0.self_attn.q_proj.scales", |_| {
+        None
+    });
+    let e = affine_refusal(
+        "affine_no_scales",
+        affine_entry(ScaleLayout::GroupMajor),
+        &t,
+    );
+    assert!(
+        matches!(e, LoadError::Missing { ix: 0, tensor } if tensor.ends_with("q_proj.scales")),
+        "{e}"
+    );
+}
+
+/// A dense bf16 `.weight` where the packed u32 codes are expected is refused as `Dtype`.
+#[test]
+fn a_dense_weight_where_packed_is_expected_is_refused() {
+    let t = edited(affine_tensors(), "layers.0.self_attn.q_proj.weight", |x| {
+        let (n, k) = (AFF_N as usize, AFF_H as usize);
+        Some((
+            x.0.clone(),
+            Dtype::BF16,
+            vec![n, k / 8],
+            vec![0; n * k / 8 * 2],
+        ))
+    });
+    let e = affine_refusal("affine_dense", affine_entry(ScaleLayout::GroupMajor), &t);
+    assert!(
+        matches!(
+            e,
+            LoadError::Dtype {
+                ix: 0,
+                got: DType::BF16,
+                ..
+            }
+        ),
+        "{e}"
+    );
+}
+
+/// A 3-bit packed width (`k · 3/32` words where 4-bit needs `k/8`) is refused as `Shape`, as GLM's
+/// 3-bit `[12288, 384]` against the 4-bit `[12288, 512]`.
+#[test]
+fn a_3_bit_packed_width_is_refused() {
+    let t = edited(affine_tensors(), "layers.0.self_attn.q_proj.weight", |x| {
+        let (n, words) = (AFF_N as usize, AFF_H as usize * 3 / 32);
+        Some((
+            x.0.clone(),
+            Dtype::U32,
+            vec![n, words],
+            vec![0; n * words * 4],
+        ))
+    });
+    let e = affine_refusal("affine_3bit", affine_entry(ScaleLayout::GroupMajor), &t);
+    let LoadError::Shape {
+        ix: 0, got, want, ..
+    } = e
+    else {
+        panic!("{e}");
+    };
+    assert_eq!((got, want), (vec![96, 12], vec![96, 16]));
+}
+
+/// F16 scales are refused as `Dtype`: the kernels read bf16, and nothing is converted.
+#[test]
+fn f16_affine_scales_are_refused() {
+    let t = edited(affine_tensors(), "layers.0.self_attn.q_proj.scales", |x| {
+        Some((x.0.clone(), Dtype::F16, x.2.clone(), x.3.clone()))
+    });
+    let e = affine_refusal("affine_f16", affine_entry(ScaleLayout::GroupMajor), &t);
+    assert!(
+        matches!(
+            e,
+            LoadError::Dtype {
+                ix: 0,
+                got: DType::F16,
+                ..
+            }
+        ),
+        "{e}"
+    );
+}
+
+/// A bundle whose checkpoint ships `gate.scales` beside the router, which the table reads dense, is
+/// refused as `QuantizedRouter`, naming both.
+#[test]
+fn a_quantized_router_is_refused_by_name() {
+    let e = affine_refusal("affine_qrouter", bundle_entry(), &bundle_tensors(true));
+    assert!(
+        matches!(
+            &e,
+            LoadError::QuantizedRouter {
+                ix: 0,
+                router: "language_model.model.layers.1.mlp.gate.weight",
+                scales,
+            } if scales == "language_model.model.layers.1.mlp.gate.scales"
+        ),
+        "{e}"
+    );
+    assert!(e.to_string().contains("quantized on disk"), "{e}");
+}

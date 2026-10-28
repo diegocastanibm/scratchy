@@ -104,6 +104,12 @@ fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
             CudaStep::RouterNorm(_) => "RouterNorm",
             CudaStep::GemmCol64(_) => "GemmCol64",
             CudaStep::BiasAdd(_) => "BiasAdd",
+            CudaStep::AffineGemm(_) => "AffineGemm",
+            CudaStep::AffineGemmCol64(_) => "AffineGemmCol64",
+            CudaStep::AffineGemv(_) => "AffineGemv",
+            CudaStep::AffineEmbed(_) => "AffineEmbed",
+            CudaStep::ExpertGemmAffine(_) => "ExpertGemmAffine",
+            CudaStep::ExpertGemvAffine(_) => "ExpertGemvAffine",
         };
         *h.entry(kind).or_default() += 1;
     }
@@ -350,6 +356,9 @@ fn the_weight_table_names_the_checkpoints_tensors() {
                 ..
             } => vec![router, gate_up, down],
             CudaWeight::ExpertBank { gate_up, down, .. } => vec![gate_up, down],
+            CudaWeight::Affine { .. } | CudaWeight::MoeBundleAffine { .. } => {
+                panic!("weight {ix}: an affine weight in a dense model")
+            }
         };
         assert!(
             leads.insert(tensors[0]),
@@ -388,6 +397,7 @@ fn the_weight_table_names_the_checkpoints_tensors() {
         CudaWeight::Bf16 { shape, .. } => shape,
         CudaWeight::GdnBundle { .. } | CudaWeight::MoeBundle { .. } => panic!("a bundle"),
         CudaWeight::ExpertBank { .. } => panic!("an expert bank"),
+        CudaWeight::Affine { .. } | CudaWeight::MoeBundleAffine { .. } => panic!("an affine weight"),
     };
     let (e, embed) = by_name("language_model.model.embed_tokens.weight");
     assert_eq!(e, 0, "the embedding table is the embedded hidden's index");

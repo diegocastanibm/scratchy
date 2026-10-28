@@ -44,22 +44,23 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use scratchy_const_tokens::{ModuleRow, ModuleTable, const_tokens};
 use scratchy_subtile::handoff::{
-    BundleTensor, SourceBinding, TargetAttnClass, TargetModelFacts, TargetModelInput, TargetPoint,
-    UnrollIndex,
+    AffineBundleTensor, BundleTensor, SourceBinding, TargetAttnClass, TargetModelFacts,
+    TargetModelInput, TargetPoint, UnrollIndex,
 };
-use scratchy_target_cuda::op_abi::CUDA_GEMM_COL64_ARCHS;
+use scratchy_target_cuda::op_abi::{CUDA_AFFINE_ARCHS, CUDA_GEMM_COL64_ARCHS};
 use scratchy_target_cuda::step::{
-    BiasAddBf16, CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, GatedDeltaNetBf16, GemmBf16,
+    AffineEmbedBf16, AffineGemmBf16, BiasAddBf16, CudaStep, EmbedBf16, ExpertGemmAffineBf16,
+    ExpertGemmBf16, ExpertGemvAffineBf16, ExpertGemvBf16, GatedDeltaNetBf16, GemmBf16,
     LayerScaleBf16, MoeRouteBf16, MoeWeight, RmsNormBf16, RouteProgram, RouterLogitsBf16,
-    gdn_conv_dim, moe_bundle_biased,
+    gdn_conv_dim, moe_bundle_affine, moe_bundle_biased,
 };
 use scratchy_target_cuda::tape::{ArenaLayout, CudaTape, GdnTape, KvTape, TapeError, WeightIx};
-use scratchy_target_cuda::weights::CudaWeight;
+use scratchy_target_cuda::weights::{AffineTensors, CudaWeight, ScaleLayout};
 
 use crate::canonical::{
-    CanonicalAt, CanonicalGdn, CanonicalKv, CanonicalRefusal, CudaAttnClass, CudaAttnClasses,
-    CudaCanonical, CudaEmbedFacts, CudaGdnFacts, CudaModelFacts, GemmColTile, GemmShapeRule,
-    SharedExpertOwner, lower_canonical,
+    CanonicalAt, CanonicalGdn, CanonicalKv, CanonicalRefusal, CudaAffine, CudaAttnClass,
+    CudaAttnClasses, CudaCanonical, CudaEmbedFacts, CudaGdnFacts, CudaModelFacts, GemmColTile,
+    GemmShapeRule, SharedExpertOwner, lower_canonical,
 };
 
 /// The modules of the CUDA tape types, and the aliases the emitted tapes name them by: the one
@@ -120,12 +121,16 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "LayerScaleBf16",
                 "SoftCapBf16",
                 "BiasAddBf16",
+                "AffineGemmBf16",
+                "AffineEmbedBf16",
+                "ExpertGemmAffineBf16",
+                "ExpertGemvAffineBf16",
             ],
         },
         ModuleRow {
             alias: "__cw",
             path: "::scratchy_target_cuda::weights",
-            types: &["CudaWeight"],
+            types: &["CudaWeight", "AffineTensors", "ScaleLayout"],
         },
     ],
 };
@@ -137,7 +142,8 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
 /// model's input is its token ids, embedded from a table of `vocab_size` rows; a config that
 /// declares none gets no embedding table here, and [`lower_model`] refuses it
 /// ([`ModelRefusal::NoVocab`]). The shared expert's owner is [`shared_expert_owner`]'s. The GEMM
-/// column tile is the 256-column one here; [`lower_model`] sets the arch's ([`gemm_col_tile`]).
+/// column tile is the 256-column one here, and affine weights are refused; [`lower_model`] sets
+/// the arch's ([`gemm_col_tile`], [`affine`]).
 pub fn model_facts(f: &TargetModelFacts) -> CudaModelFacts {
     CudaModelFacts {
         shared_expert: shared_expert_owner(f),
@@ -161,6 +167,7 @@ pub fn model_facts(f: &TargetModelFacts) -> CudaModelFacts {
             _ => None,
         },
         gemm_col_tile: GemmColTile::Tile256Only,
+        affine: CudaAffine::Refuse,
     }
 }
 
@@ -194,6 +201,19 @@ pub fn gemm_col_tile(arch: &str) -> GemmColTile {
     match CUDA_GEMM_COL64_ARCHS.contains(&arch) {
         true => GemmColTile::Col64,
         false => GemmColTile::Tile256Only,
+    }
+}
+
+/// Whether `input`'s arch's affine weights lower: `op_abi::CUDA_AFFINE_ARCHS` names it, or not. A
+/// lowering arch's embedding table is the handoff's `embed_affine`, and its routers are the
+/// handoff's `moe_affine` plans' (the first quantized one, if any).
+pub fn affine(input: &TargetModelInput) -> CudaAffine {
+    match CUDA_AFFINE_ARCHS.contains(&input.arch.as_str()) {
+        true => CudaAffine::Lower {
+            embed: (input.facts.embed_affine).map(|a| (a.bits, a.group_size)),
+            router: (input.moe_affine.iter()).find_map(|(.., plan)| plan.router),
+        },
+        false => CudaAffine::Refuse,
     }
 }
 
@@ -267,6 +287,12 @@ pub enum ModelRefusal {
     /// (`step::moe_bundle_biased`), which no weight-table entry loads: the GLM checkpoint in
     /// scope is affine (#948), and the dense per-expert form is not loaded.
     NoBiasedBundle { ix: usize },
+    /// Weight `ix` is an MLX-affine MoE bundle, and the handoff's `affine_bundle_names` names no
+    /// `tensor` of it.
+    NoAffineName {
+        ix: usize,
+        tensor: AffineBundleTensor,
+    },
 }
 
 impl std::fmt::Display for ModelRefusal {
@@ -343,6 +369,11 @@ impl std::fmt::Display for ModelRefusal {
                 "weight {ix} is a dense MoE bundle with a GLM correction bias, which the CUDA \
                  loader does not take (GLM-4.5-Air's CUDA path is its affine 4-bit checkpoint)"
             ),
+            Self::NoAffineName { ix, tensor } => write!(
+                f,
+                "weight {ix} is an MLX-affine MoE bundle, and the handoff names no {tensor:?} \
+                 tensor of it"
+            ),
         }
     }
 }
@@ -378,6 +409,7 @@ pub fn lower_model(input: &TargetModelInput) -> Result<CudaModel, ModelRefusal> 
     }
     let facts = CudaModelFacts {
         gemm_col_tile: gemm_col_tile(&input.arch),
+        affine: affine(input),
         ..model_facts(&input.facts)
     };
     let mut by_m: BTreeMap<u32, Vec<(u32, Lowered)>> = BTreeMap::new();
@@ -472,6 +504,11 @@ enum Role {
     MoeBundleBiased([u32; 3]),
     /// One Gemma layer's dense expert bank of this geometry: `experts`, `hidden`, `inter`.
     ExpertBank([u32; 3]),
+    /// One MLX-affine `[n, k]` weight of this group, its scales in this order: `n`, `k`, `group`.
+    Affine([u32; 3], ScaleLayout),
+    /// One GLM MoE layer's MLX-affine bundle of this geometry: `experts`, `hidden`, `inter`,
+    /// `group`.
+    MoeBundleAffine([u32; 4]),
 }
 
 impl Role {
@@ -481,7 +518,9 @@ impl Role {
             Self::Bundle(_)
             | Self::MoeBundle(_)
             | Self::MoeBundleBiased(_)
-            | Self::ExpertBank(_) => &[],
+            | Self::ExpertBank(_)
+            | Self::Affine(..)
+            | Self::MoeBundleAffine(_) => &[],
         }
     }
 }
@@ -592,6 +631,55 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             inter,
             ..
         }) => Some((bundle, Role::ExpertBank([experts, hidden, inter]))),
+        // An affine GEMM's `B`, its scales group-major; the affine embed's table, row-major.
+        CudaStep::AffineGemm(AffineGemmBf16 { b, n, k, group, .. })
+        | CudaStep::AffineGemmCol64(AffineGemmBf16 { b, n, k, group, .. })
+        | CudaStep::AffineGemv(AffineGemmBf16 { b, n, k, group, .. }) => {
+            Some((b, Role::Affine([n, k, group], ScaleLayout::GroupMajor)))
+        }
+        CudaStep::AffineEmbed(AffineEmbedBf16 {
+            table,
+            hidden,
+            vocab,
+            group,
+            ..
+        }) => Some((
+            table,
+            Role::Affine([vocab, hidden, group], ScaleLayout::RowMajor),
+        )),
+        // GLM's affine bundle: its affine expert steps name it with its group. Its router step
+        // reads its first `[experts, hidden]` bf16, and has no role of its own here.
+        CudaStep::ExpertGemmAffine(ExpertGemmAffineBf16 {
+            bundle,
+            experts,
+            hidden,
+            inter,
+            group,
+            ..
+        })
+        | CudaStep::ExpertGemvAffine(ExpertGemvAffineBf16 {
+            bundle,
+            experts,
+            hidden,
+            inter,
+            group,
+            ..
+        }) => Some((
+            bundle,
+            Role::MoeBundleAffine([experts, hidden, inter, group]),
+        )),
+        CudaStep::RouterLogits(RouterLogitsBf16 {
+            weight: MoeWeight::AffineBank,
+            ..
+        }) => None,
+        CudaStep::ExpertGemm(ExpertGemmBf16 {
+            weight: MoeWeight::AffineBank,
+            ..
+        })
+        | CudaStep::ExpertGemv(ExpertGemvBf16 {
+            weight: MoeWeight::AffineBank,
+            ..
+        }) => None,
         CudaStep::Add(_)
         | CudaStep::SiluMul(_)
         | CudaStep::Rope(_)
@@ -700,6 +788,14 @@ pub fn weight_table(
                 {
                     Some(Role::MoeBundleBiased(g))
                 }
+                // An affine bundle carries its correction bias as a slab of its own.
+                Some(Role::MoeBundleAffine(g @ [experts, hidden, inter, group]))
+                    if moe_bundle_affine(experts, hidden, inter, group)
+                        .map(|b| b.correction_bias)
+                        == Some(offset) =>
+                {
+                    Some(Role::MoeBundleAffine(g))
+                }
                 other => {
                     return Err(ModelRefusal::WeightRole {
                         ix,
@@ -722,6 +818,11 @@ pub fn weight_table(
     let bundle_names: HashMap<(u32, Option<UnrollIndex>, BundleTensor), &str> =
         (input.bundle_tensor_names.iter())
             .map(|(id, index, tensor, name)| ((*id, *index, *tensor), name.as_str()))
+            .collect();
+    // An affine MoE bundle's tensors, each named in full by the handoff (`AFFINE_BUNDLE_LEAVES`).
+    let affine_names: HashMap<(u32, Option<UnrollIndex>, AffineBundleTensor), &'static str> =
+        (input.affine_bundle_names.iter())
+            .map(|(id, index, tensor, name)| ((*id, *index, *tensor), baked_str(name.clone())))
             .collect();
     let mut table: Vec<Option<CudaWeight>> = vec![None; n];
     for ix in 0..n {
@@ -806,6 +907,46 @@ pub fn weight_table(
                     binding: binding.clone(),
                 });
             }
+            Role::Affine([n, k, group], layout) => CudaWeight::Affine {
+                weight: baked_str(format!("{prefix}.weight")),
+                scales: baked_str(format!("{prefix}.scales")),
+                biases: baked_str(format!("{prefix}.biases")),
+                n,
+                k,
+                group,
+                layout,
+            },
+            Role::MoeBundleAffine([experts, hidden, inter, group]) => {
+                let SourceBinding::Weight { id, index } = *binding else {
+                    return Err(ModelRefusal::NoPrefix {
+                        ix,
+                        binding: binding.clone(),
+                    });
+                };
+                let name = |tensor| {
+                    (affine_names.get(&(id, index, tensor)).copied())
+                        .ok_or(ModelRefusal::NoAffineName { ix, tensor })
+                };
+                use AffineBundleTensor as T;
+                let tensors = |w, s, b| -> Result<AffineTensors, ModelRefusal> {
+                    Ok(AffineTensors {
+                        weight: name(w)?,
+                        scales: name(s)?,
+                        biases: name(b)?,
+                    })
+                };
+                CudaWeight::MoeBundleAffine {
+                    router: name(T::Router)?,
+                    correction_bias: name(T::CorrectionBias)?,
+                    gate: tensors(T::GateW, T::GateScales, T::GateBiases)?,
+                    up: tensors(T::UpW, T::UpScales, T::UpBiases)?,
+                    down: tensors(T::DownW, T::DownScales, T::DownBiases)?,
+                    experts,
+                    hidden,
+                    inter,
+                    group,
+                }
+            }
         };
         let (packed, declared) = (entry.packed_bytes().unwrap_or(u64::MAX), declared(ix));
         if packed != declared {
@@ -882,7 +1023,11 @@ fn bundle_entry(
             hidden,
             inter,
         },
-        Role::Bundle(_) | Role::MoeBundle(_) | Role::MoeBundleBiased(_) => return None,
+        Role::Bundle(_)
+        | Role::MoeBundle(_)
+        | Role::MoeBundleBiased(_)
+        | Role::Affine(..)
+        | Role::MoeBundleAffine(_) => return None,
     })
 }
 

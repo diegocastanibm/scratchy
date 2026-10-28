@@ -309,8 +309,9 @@ pub enum ForwardError {
     Launch { step: usize, error: KernelError },
     /// The `step`-th step is `op`, a step no kernel launches: a Qwen routing at another count than
     /// [`MOE_ROUTE_EXPERTS`], the Qwen program's one instance (#921); GLM's bias add and routing,
-    /// and an append or attention at head dim [`ATTN_D128_BF16_HEAD_DIM`] (#938's 14b). Checked
-    /// over the whole tape before anything is uploaded or enqueued.
+    /// and an append or attention at head dim [`ATTN_D128_BF16_HEAD_DIM`] (#938's 14b); the six
+    /// MLX-affine steps (#949, #950). Checked over the whole tape before anything is uploaded or
+    /// enqueued.
     NotLaunched { step: usize, op: &'static str },
     /// A copy or the stream wait failed; the stream was drained.
     Cuda(CudaError),
@@ -584,7 +585,9 @@ fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, 
 /// - the Qwen routing at another count than [`MOE_ROUTE_EXPERTS`]: the routing kernel's Qwen
 ///   program is instantiated at 256 only (its launcher refuses any other count);
 /// - GLM's bias add and its sigmoid-and-bias routing, and a KV append or an attention at head dim
-///   [`ATTN_D128_BF16_HEAD_DIM`]: their kernels are #938's 14b, which removes these arms.
+///   [`ATTN_D128_BF16_HEAD_DIM`]: their kernels are #938's 14b, which removes these arms;
+/// - the six MLX-affine steps: the affine GEMM, GEMV and embed are #949's, the affine expert GEMM
+///   and GEMV #950's, which remove these arms.
 ///
 /// `None` for every other step. Every variant is named, so a new step states its case here.
 fn not_launched(s: &CudaStep) -> Option<&'static str> {
@@ -599,6 +602,12 @@ fn not_launched(s: &CudaStep) -> Option<&'static str> {
             ..
         }) => Some("MoeRoute"),
         CudaStep::BiasAdd(_) => Some("BiasAdd"),
+        CudaStep::AffineGemm(_) => Some("AffineGemm"),
+        CudaStep::AffineGemmCol64(_) => Some("AffineGemmCol64"),
+        CudaStep::AffineGemv(_) => Some("AffineGemv"),
+        CudaStep::AffineEmbed(_) => Some("AffineEmbed"),
+        CudaStep::ExpertGemmAffine(_) => Some("ExpertGemmAffine"),
+        CudaStep::ExpertGemvAffine(_) => Some("ExpertGemvAffine"),
         CudaStep::RopeAppend(RopeAppendBf16 {
             head_dim: ATTN_D128_BF16_HEAD_DIM,
             ..
@@ -1377,6 +1386,17 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         step,
                         op: "BiasAdd",
                     });
+                }
+                // No kernels yet (#949, #950): `not_launched` refused the tape before any copy, so
+                // these arms are never reached.
+                CudaStep::AffineGemm(_)
+                | CudaStep::AffineGemmCol64(_)
+                | CudaStep::AffineGemv(_)
+                | CudaStep::AffineEmbed(_)
+                | CudaStep::ExpertGemmAffine(_)
+                | CudaStep::ExpertGemvAffine(_) => {
+                    let op = not_launched(s).expect("not_launched names every affine step");
+                    return Err(ForwardError::NotLaunched { step, op });
                 }
                 CudaStep::GemmCol64(GemmBf16 { a, b, c, m, n, k }) => {
                     let b = weights[b.0 as usize].ptr();

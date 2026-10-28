@@ -26,6 +26,7 @@ use scratchy_target_cuda::step::{CudaStep, EmbedBf16, GemmBf16};
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, TapeInput, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
 use scratchy_target_cuda_compiler::canonical::AttnShapeRule;
+use scratchy_target_cuda_compiler::canonical::CudaAffine;
 use scratchy_target_cuda_compiler::canonical::GemmColTile;
 use scratchy_target_cuda_compiler::canonical::{
     ArenaRefusal, CanonicalAt, CanonicalRefusal, CudaEmbedFacts, CudaModelFacts, CudaPlan,
@@ -56,6 +57,7 @@ const FACTS: CudaModelFacts = CudaModelFacts {
     shared_expert: SharedExpertOwner::Undeclared,
     classes: None,
     gemm_col_tile: GemmColTile::Tile256Only,
+    affine: CudaAffine::Refuse,
 };
 
 fn fixtures() -> Vec<(&'static str, LoweringInput)> {
@@ -225,6 +227,7 @@ fn a_rope_on_the_hidden_with_the_global_table_lowers_to_one_rope() {
         shared_expert: SharedExpertOwner::Undeclared,
         classes: None,
         gemm_col_tile: GemmColTile::Tile256Only,
+        affine: CudaAffine::Refuse,
     };
     let c = lower_canonical(&l, facts, AT).expect("the rope lowers");
     let [CudaStep::Rope(rope)] = c.steps.as_slice() else {

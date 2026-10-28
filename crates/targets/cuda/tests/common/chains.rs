@@ -13,6 +13,7 @@ use scratchy_target_cuda::step::{CudaStep, GemmBf16};
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, TapeInput, WeightIx,
 };
+use scratchy_target_cuda_compiler::canonical::CudaAffine;
 use scratchy_target_cuda_compiler::canonical::GemmColTile;
 use scratchy_target_cuda_compiler::canonical::{
     CanonicalAt, CanonicalGdn, CanonicalKv, CudaCanonical, CudaGdnFacts, CudaModelFacts,
@@ -31,6 +32,7 @@ pub const QWEN3_5_FACTS: CudaModelFacts = CudaModelFacts {
     shared_expert: SharedExpertOwner::Undeclared,
     classes: None,
     gemm_col_tile: GemmColTile::Tile256Only,
+    affine: CudaAffine::Refuse,
 };
 
 /// [`QWEN3_5_FACTS`] with qwen3.5-0.8b's linear attention: 16 key heads of 128, a 4-tap conv,

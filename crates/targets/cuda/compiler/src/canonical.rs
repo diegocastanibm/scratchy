@@ -72,6 +72,29 @@ pub struct CudaModelFacts {
     /// Which column tiles the model's GEMMs take: the 256-column tile only, or the 64-column tile
     /// too (`op_abi::CUDA_GEMM_COL64_ARCHS`).
     pub gemm_col_tile: GemmColTile,
+    /// Whether the model's MLX-affine weights lower to CUDA's affine steps, or are refused as
+    /// today (`op_abi::CUDA_AFFINE_ARCHS`).
+    pub affine: CudaAffine,
+}
+
+/// Whether a model's MLX-affine weights lower.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CudaAffine {
+    /// An affine GEMM or expert bank is refused (`CanonicalRefusal::GemmWeight`,
+    /// `MoeShapeRule::Affine`), and an affine embedding table is read as a dense one: every Qwen
+    /// and Gemma model.
+    Refuse,
+    /// Affine weights of a form `op_abi::CUDA_AFFINE_FORMS` names lower to the affine steps, and
+    /// the embedding table is the one the handoff describes: GLM-4.5-Air.
+    Lower {
+        /// The token-embedding table's storage (the handoff's `TargetModelFacts::embed_affine`):
+        /// `Some((bits, group))` when the checkpoint ships it packed, `None` when dense.
+        embed: Option<(u32, u32)>,
+        /// The width of an affine MoE bundle's router when the checkpoint ships one quantized (the
+        /// first `TargetMoeAffine::router` of the handoff's `moe_affine` that is `Some`), refused
+        /// at the router step (`MoeShapeRule::AffineRouter`); `None` when every router is dense.
+        router: Option<u32>,
+    },
 }
 
 /// Which column tiles a model's GEMMs take.
@@ -283,6 +306,15 @@ pub enum CanonicalRefusal {
     GemmWeight {
         step: usize,
         weight: GemmWeightKind,
+    },
+    /// The `step`-th `Compute` is a GEMM over an MLX-affine weight of a model whose affine weights
+    /// lower, and CUDA has no affine step for it.
+    AffineGemm {
+        step: usize,
+        m: u32,
+        n: u32,
+        k: u32,
+        rule: GemmWeightRule,
     },
     /// An operand of the `step`-th `Compute` that its kernel cannot bind.
     Operand {
@@ -513,6 +545,15 @@ pub enum CanonicalRefusal {
     Arena(ArenaRefusal),
 }
 
+/// Which rule an MLX-affine weight breaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GemmWeightRule {
+    /// Its `(bits, group)` is not one of `op_abi::CUDA_AFFINE_FORMS`.
+    AffineForm { bits: u32, group: u32 },
+    /// Its `n` is one only the narrow bf16 GEMM takes; CUDA has no narrow affine GEMM.
+    AffineNarrow,
+}
+
 /// Which rule a MoE op breaks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoeShapeRule {
@@ -520,6 +561,12 @@ pub enum MoeShapeRule {
     Bundle,
     /// The expert bank is affine; CUDA's expert kernels take dense bf16 only.
     Affine,
+    /// The expert bank is affine of a `(bits, group)` that is not one of
+    /// `op_abi::CUDA_AFFINE_FORMS` (`GemmWeightRule::AffineForm`'s expert twin).
+    AffineForm { bits: u32, group: u32 },
+    /// The affine bundle ships its router quantized (`TargetMoeAffine::router` is `Some`); CUDA
+    /// has no affine router kernel, and its router step reads it dense at byte 0.
+    AffineRouter { bits: u32 },
     /// The gated activation is neither SiLU (`silu_mul_bf16.cu`) nor GELU (the `GeluMul` step).
     Activation,
     /// The routing is not the fold of a softmax, an argsort and a gather (and a renorm).
@@ -547,6 +594,9 @@ pub enum EmbedShapeRule {
     AboveIntMax { dim: &'static str, value: u32 },
     /// `rows · hidden` is above `i32::MAX`, the largest element count the launcher indexes.
     TooManyElements { elements: u64 },
+    /// The table is MLX-affine of a `(bits, group)` that is not one of
+    /// `op_abi::CUDA_AFFINE_FORMS`, or whose group does not tile `hidden`.
+    AffineForm { bits: u32, group: u32 },
 }
 
 /// Which rule a `GatedDeltaNet`'s geometry breaks: the four kernels', stated at expansion time.
@@ -773,6 +823,17 @@ impl std::fmt::Display for CanonicalRefusal {
             Self::GemmWeight { step, weight } => write!(
                 f,
                 "step {step} is a GEMM over a {weight:?} weight; the bf16 kernel takes Dense only"
+            ),
+            Self::AffineGemm {
+                step,
+                m,
+                n,
+                k,
+                rule,
+            } => write!(
+                f,
+                "step {step} is a GEMM of m={m} n={n} k={k} over an affine weight, which the cuda \
+                 backend has no affine step for: {rule}"
             ),
             Self::Operand {
                 step,
@@ -1026,6 +1087,17 @@ impl std::fmt::Display for MoeShapeRule {
                  GEMM for"
             ),
             Self::Affine => write!(f, "its experts are affine; CUDA's take dense bf16 only"),
+            Self::AffineForm { bits, group } => write!(
+                f,
+                "its experts are {bits}-bit affine at group {group}; CUDA's affine expert steps \
+                 take {:?} (bits, group)",
+                scratchy_target_cuda::op_abi::CUDA_AFFINE_FORMS
+            ),
+            Self::AffineRouter { bits } => write!(
+                f,
+                "its bundle ships the router {bits}-bit affine; CUDA's router step reads it dense \
+                 bf16, and CUDA has no affine router kernel"
+            ),
             Self::Activation => write!(f, "its gated activation is neither SiLU nor GELU"),
             Self::Routing => write!(
                 f,
@@ -1051,6 +1123,22 @@ impl std::fmt::Display for MoeShapeRule {
     }
 }
 
+impl std::fmt::Display for GemmWeightRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AffineForm { bits, group } => write!(
+                f,
+                "it is {bits}-bit at group {group}; CUDA's affine steps take {:?} (bits, group)",
+                scratchy_target_cuda::op_abi::CUDA_AFFINE_FORMS
+            ),
+            Self::AffineNarrow => write!(
+                f,
+                "only the narrow bf16 GEMM takes this n, and CUDA has no narrow affine GEMM"
+            ),
+        }
+    }
+}
+
 impl std::fmt::Display for EmbedShapeRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1067,6 +1155,12 @@ impl std::fmt::Display for EmbedShapeRule {
                 "rows·hidden = {elements} is above {}, the largest element count the launcher \
                  indexes",
                 i32::MAX
+            ),
+            Self::AffineForm { bits, group } => write!(
+                f,
+                "the table is {bits}-bit affine at group {group}; CUDA's affine embed takes {:?} \
+                 (bits, group), a group that tiles hidden",
+                scratchy_target_cuda::op_abi::CUDA_AFFINE_FORMS
             ),
         }
     }
@@ -1469,9 +1563,12 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
                 WeightIx(e as u32),
                 ArenaOffset(arena.offsets[0]),
                 (hidden.rows, hidden.cols, vocab),
+                plan.facts.affine,
             )?;
+            // The table's bytes: the bf16 `[vocab, hidden]`, or the affine buffer the step reads.
+            let table = step.extents().and_then(|x| x.weight).map(|w| w.bytes);
             steps.insert(0, step);
-            Some((e, tokens, vocab, hidden))
+            Some((e, tokens, vocab, hidden, table))
         }
         _ => None,
     };
@@ -1482,12 +1579,13 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     };
     let result = span(plan.colouring.result());
     let input = match head {
-        Some((_, span, vocab, _)) => TapeInput::TokenIds { span, vocab },
+        Some((_, span, vocab, ..)) => TapeInput::TokenIds { span, vocab },
         None => TapeInput::Hidden(span(Colour::ZERO)),
     };
     // A GDN or MoE step's bundle is a `[1, 1]` source in the IR; on the device it is the packed
-    // bundle of the step's geometry (`gdn_bundle`, `moe_bundle`, `moe_bundle_biased`), which its
-    // extents read. GLM's routing reads its bundle further than the router and expert steps do,
+    // bundle of the step's geometry (`gdn_bundle`, `moe_bundle`, `moe_bundle_biased`,
+    // `moe_bundle_affine`), which its extents read; an affine GEMM's `[k, n]` source is its packed
+    // buffer (`affine_weight`), not `[n, k]` bf16. GLM's routing reads its bundle further than the router and expert steps do,
     // to the correction bias, so a bundle is the most any step reads of it.
     let mut bundles: BTreeMap<u32, u64> = BTreeMap::new();
     for (ix, bytes) in steps.iter().filter_map(|s| match s {
@@ -1495,6 +1593,11 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         CudaStep::RouterLogits(_)
         | CudaStep::ExpertGemm(_)
         | CudaStep::ExpertGemv(_)
+        | CudaStep::ExpertGemmAffine(_)
+        | CudaStep::ExpertGemvAffine(_)
+        | CudaStep::AffineGemm(_)
+        | CudaStep::AffineGemmCol64(_)
+        | CudaStep::AffineGemv(_)
         | CudaStep::MoeRoute(MoeRouteBf16 {
             program: RouteProgram::GlmSigmoidBias { .. },
             ..
@@ -1520,9 +1623,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
             }
             // The embedded hidden's source holds the embedding table the head gathers from.
             SourceBinding::EmbeddedHidden => match head {
-                Some((e, _, vocab, hidden)) if e == t => {
-                    elements_bytes(vocab, hidden.cols).ok_or(ArenaRefusal::TooLarge)
-                }
+                Some((e, .., table)) if e == t => table.ok_or(ArenaRefusal::TooLarge),
                 _ => Ok(0),
             },
             _ => Ok(0),

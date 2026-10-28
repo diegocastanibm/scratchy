@@ -13,11 +13,12 @@ use serde::Serialize;
 
 use crate::op_abi::CUDA_EXPERT_TILE_ROWS;
 use crate::step::{
-    ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AttnPrefillBf16, BiasAddBf16, CUDA_KV_BLOCK_SIZE,
-    CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertSortBf16,
-    GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES,
-    GatedDeltaNetBf16, GemmBf16, MoeRouteBf16, RmsNormBf16, RopeAppendBf16, RopeBf16, RouteProgram,
-    RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch, moe_bundle_biased,
+    ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AffineEmbedBf16, AffineGemmBf16, AttnPrefillBf16,
+    BiasAddBf16, CUDA_KV_BLOCK_SIZE, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmAffineBf16,
+    ExpertGemmBf16, ExpertGemvAffineBf16, ExpertGemvBf16, ExpertSortBf16, GDN_CONV_KERNEL_RANGE,
+    GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES, GatedDeltaNetBf16,
+    GemmBf16, MoeRouteBf16, MoeWeight, RmsNormBf16, RopeAppendBf16, RopeBf16, RouteProgram,
+    RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch, moe_bundle_affine, moe_bundle_biased,
     sort_index_regions,
 };
 
@@ -730,6 +731,27 @@ pub enum TapeError {
         offset: u64,
         want: Option<u64>,
     },
+    /// The `step`-th step is an affine step whose `(n, k, group)` is not one of
+    /// `op_abi::CUDA_AFFINE_FORMS`' 4-bit forms: `k` not a non-zero multiple of `group`, a group
+    /// CUDA has no step for, or a layout that overflows. Each affine step's `k` is a whole number
+    /// of groups (`AffineInt4::mint`), so no step has a K tail.
+    AffineGroup {
+        step: usize,
+        n: u32,
+        k: u32,
+        group: u32,
+    },
+    /// The `step`-th step is an affine step, and weight `ix` is not an affine weight-table entry
+    /// of its `(n, k, group)`: the tape declares it `declared` bytes, the affine buffer is `want`.
+    AffineWeight {
+        step: usize,
+        ix: u32,
+        declared: u64,
+        want: Option<u64>,
+    },
+    /// The `step`-th step is an expert step whose bundle's layout is not its kind's: an affine
+    /// expert step reading a dense bundle or bank, or a dense one reading an affine bank.
+    ExpertWeight { step: usize, weight: MoeWeight },
 }
 
 impl std::fmt::Display for TapeError {
@@ -1095,6 +1117,38 @@ impl std::fmt::Display for TapeError {
                 "step {step} reads its routing's correction bias at byte {offset} of its bundle; \
                  the tape's MoE geometry overflows u64"
             ),
+            Self::AffineGroup { step, n, k, group } => write!(
+                f,
+                "step {step} is an affine step of n={n} k={k} group={group}; k must be a \
+                 non-zero multiple of a group of {:?}",
+                crate::op_abi::CUDA_AFFINE_FORMS
+            ),
+            Self::AffineWeight {
+                step,
+                ix,
+                declared,
+                want: Some(want),
+            } => write!(
+                f,
+                "step {step} reads weight {ix} as an affine buffer of {want} bytes; the tape \
+                 declares {declared}"
+            ),
+            Self::AffineWeight {
+                step,
+                ix,
+                declared,
+                want: None,
+            } => write!(
+                f,
+                "step {step} reads weight {ix} as an affine buffer whose size overflows u64; the \
+                 tape declares {declared}"
+            ),
+            Self::ExpertWeight { step, weight } => write!(
+                f,
+                "step {step} is an expert step of the other storage than its bundle, a \
+                 {weight:?}: an affine step reads an AffineBank, a dense one a Bundle or an Own \
+                 bank"
+            ),
         }
     }
 }
@@ -1187,6 +1241,9 @@ impl CudaTape {
         let scratch = self.gdn_regions(total, &mut regions)?;
         let moe = self.moe_regions(total, &regions)?;
         for (step, s) in self.steps.iter().enumerate() {
+            // Before the extents, which size an affine step by its form and an expert step by its
+            // bundle's layout: a form or a layout they have none for is refused by name.
+            self.check_affine_form(step, s)?;
             let e = s.extents().ok_or(TapeError::StepOverflow { step })?;
             let reads = e.reads.iter().flatten();
             let writes = [Some(e.writes), e.second_write];
@@ -1287,8 +1344,8 @@ impl CudaTape {
     /// embed reading it, with its rows and vocabulary; no other step embeds, and a tape whose
     /// input is the embedded hidden has no embed.
     fn check_embed(&self) -> Result<(), TapeError> {
-        let embeds =
-            (self.steps.iter().enumerate()).filter(|(_, s)| matches!(s, CudaStep::Embed(_)));
+        let embeds = (self.steps.iter().enumerate())
+            .filter(|(_, s)| matches!(s, CudaStep::Embed(_) | CudaStep::AffineEmbed(_)));
         match self.input {
             TapeInput::Hidden(_) => match embeds.map(|(step, _)| step).next() {
                 Some(step) => Err(TapeError::EmbedMisplaced { step }),
@@ -1309,17 +1366,26 @@ impl CudaTape {
                 if let Some((step, _)) = embeds.clone().find(|&(step, _)| step > 0) {
                     return Err(TapeError::EmbedMisplaced { step });
                 }
-                let Some(&CudaStep::Embed(EmbedBf16 {
-                    tokens,
-                    out,
-                    rows,
-                    hidden,
-                    vocab: embed_vocab,
-                    ..
-                })) = self.steps.first()
-                else {
-                    let first = (!self.steps.is_empty()).then_some(0);
-                    return Err(TapeError::EmbedMissing { first });
+                // The bf16 embed, or its affine counterpart: the same tokens, rows and output.
+                let (tokens, out, rows, hidden, embed_vocab) = match self.steps.first() {
+                    Some(&CudaStep::Embed(EmbedBf16 {
+                        tokens,
+                        out,
+                        rows,
+                        hidden,
+                        vocab,
+                        ..
+                    }))
+                    | Some(&CudaStep::AffineEmbed(AffineEmbedBf16 {
+                        tokens,
+                        out,
+                        rows,
+                        hidden,
+                        vocab,
+                        ..
+                    })) => (tokens, out, rows, hidden, vocab),
+                    Some(_) => return Err(TapeError::EmbedMissing { first: Some(0) }),
+                    None => return Err(TapeError::EmbedMissing { first: None }),
                 };
                 if (tokens, rows, embed_vocab) != (span.offset, self.bucket_m, vocab) {
                     return Err(TapeError::EmbedInput { step: 0 });
@@ -1673,7 +1739,26 @@ impl CudaTape {
             | CudaStep::ExpertSort(_)
             | CudaStep::ExpertGemm(_)
             | CudaStep::ExpertGemv(_)
+            | CudaStep::ExpertGemmAffine(_)
+            | CudaStep::ExpertGemvAffine(_)
             | CudaStep::ExpertCombine(_) => self.check_moe_step(step, s),
+            // An affine weight is the tape's affine buffer of the step's form, exactly: a dense
+            // `[n, k]` weight declared in its place would be read as packed codes.
+            CudaStep::AffineGemm(g) | CudaStep::AffineGemmCol64(g) | CudaStep::AffineGemv(g) => {
+                self.one_row(step, s)?;
+                let want = crate::step::affine_weight(g.n, g.k, g.group).map(|w| w.bytes);
+                self.affine_weight_is(step, g.b, want)
+            }
+            CudaStep::AffineEmbed(AffineEmbedBf16 {
+                table,
+                hidden,
+                vocab,
+                group,
+                ..
+            }) => {
+                let want = crate::step::affine_weight(vocab, hidden, group).map(|w| w.bytes);
+                self.affine_weight_is(step, table, want)
+            }
             CudaStep::Embed(_)
             | CudaStep::Gemm(_)
             | CudaStep::GemmNarrow(_)
@@ -1763,6 +1848,8 @@ impl CudaTape {
                 | CudaStep::ExpertSort(_)
                 | CudaStep::ExpertGemm(_)
                 | CudaStep::ExpertGemv(_)
+                | CudaStep::ExpertGemmAffine(_)
+                | CudaStep::ExpertGemvAffine(_)
                 | CudaStep::ExpertCombine(_)
         );
         if moe_step {
@@ -1848,9 +1935,17 @@ impl CudaTape {
                 if (m, experts, top_k) != (self.bucket_m, moe.experts, moe.top_k) {
                     return Err(geometry);
                 }
-                if let RouteProgram::GlmSigmoidBias { bias_offset, .. } = program {
-                    let want =
-                        moe_bundle_biased(moe.experts, moe.hidden, moe.inter).map(|b| b.bias);
+                if let RouteProgram::GlmSigmoidBias { bias, bias_offset } = program {
+                    // The bias sits where the layout of the bundle the routing reads places it:
+                    // an affine bundle's (the group its affine expert steps name), else the
+                    // dense bundle's, after its experts.
+                    let want = match self.affine_group_of(bias) {
+                        Some(group) => moe_bundle_affine(moe.experts, moe.hidden, moe.inter, group)
+                            .map(|b| b.correction_bias),
+                        None => {
+                            moe_bundle_biased(moe.experts, moe.hidden, moe.inter).map(|b| b.bias)
+                        }
+                    };
                     if want != Some(bias_offset) {
                         return Err(TapeError::RouteBiasOffset {
                             step,
@@ -1948,6 +2043,13 @@ impl CudaTape {
                 }
                 want(output.0, c, output.1)
             }
+            // An affine expert step's regions and geometry are its dense twin's.
+            CudaStep::ExpertGemmAffine(g) => {
+                self.check_moe_step(step, &CudaStep::ExpertGemm(g.twin()))
+            }
+            CudaStep::ExpertGemvAffine(g) => {
+                self.check_moe_step(step, &CudaStep::ExpertGemv(g.twin()))
+            }
             CudaStep::ExpertCombine(ExpertCombineBf16 {
                 down,
                 pos,
@@ -1973,11 +2075,135 @@ impl CudaTape {
         }
     }
 
+    /// An affine step's form is one of `op_abi::CUDA_AFFINE_FORMS` and its `k` a non-zero multiple
+    /// of its group; an expert step reads a bundle of its own kind's layout (an affine step an
+    /// [`MoeWeight::AffineBank`], a dense one a `Bundle` or `Own` bank). Any other step passes.
+    fn check_affine_form(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
+        let form = |n: u32, k: u32, group: u32| {
+            let taken = (crate::op_abi::CUDA_AFFINE_FORMS.iter()).any(|&(_, g)| g == group);
+            match taken && k != 0 && k.is_multiple_of(group) {
+                true => Ok(()),
+                false => Err(TapeError::AffineGroup { step, n, k, group }),
+            }
+        };
+        let storage = |weight: MoeWeight, affine: bool| match (weight, affine) {
+            (MoeWeight::AffineBank, true) | (MoeWeight::Bundle | MoeWeight::Own, false) => Ok(()),
+            (MoeWeight::AffineBank, false) | (MoeWeight::Bundle | MoeWeight::Own, true) => {
+                Err(TapeError::ExpertWeight { step, weight })
+            }
+        };
+        match *s {
+            CudaStep::AffineGemm(g) | CudaStep::AffineGemmCol64(g) | CudaStep::AffineGemv(g) => {
+                form(g.n, g.k, g.group)
+            }
+            CudaStep::AffineEmbed(AffineEmbedBf16 {
+                hidden,
+                vocab,
+                group,
+                ..
+            }) => form(vocab, hidden, group),
+            CudaStep::ExpertGemmAffine(ExpertGemmAffineBf16 {
+                weight,
+                proj,
+                hidden,
+                inter,
+                group,
+                ..
+            })
+            | CudaStep::ExpertGemvAffine(ExpertGemvAffineBf16 {
+                weight,
+                proj,
+                hidden,
+                inter,
+                group,
+                ..
+            }) => {
+                storage(weight, true)?;
+                let (n, k) = proj.n_k(hidden, inter);
+                // The bundle's every slab is of the group: both widths must be whole groups.
+                form(n, k, group)?;
+                form(k, n, group)
+            }
+            CudaStep::ExpertGemm(ExpertGemmBf16 { weight, .. })
+            | CudaStep::ExpertGemv(ExpertGemvBf16 { weight, .. })
+            | CudaStep::RouterLogits(RouterLogitsBf16 {
+                weight: weight @ (MoeWeight::Bundle | MoeWeight::Own),
+                ..
+            }) => storage(weight, false),
+            // A router step reads only its bundle's dense router, at byte 0 of any layout.
+            CudaStep::RouterLogits(RouterLogitsBf16 {
+                weight: MoeWeight::AffineBank,
+                ..
+            })
+            | CudaStep::Embed(_)
+            | CudaStep::Gemm(_)
+            | CudaStep::GemmNarrow(_)
+            | CudaStep::Gemv(_)
+            | CudaStep::RmsNorm(_)
+            | CudaStep::Add(_)
+            | CudaStep::SiluMul(_)
+            | CudaStep::Rope(_)
+            | CudaStep::GateSplit(_)
+            | CudaStep::GateApply(_)
+            | CudaStep::RopeAppend(_)
+            | CudaStep::AttnPrefill(_)
+            | CudaStep::AttnDecode(_)
+            | CudaStep::GatedDeltaNet(_)
+            | CudaStep::MoeRoute(_)
+            | CudaStep::ExpertSort(_)
+            | CudaStep::ExpertCombine(_)
+            | CudaStep::GateScale(_)
+            | CudaStep::Scale(_)
+            | CudaStep::RmsNormUnit(_)
+            | CudaStep::GeluMul(_)
+            | CudaStep::LayerScale(_)
+            | CudaStep::SoftCap(_)
+            | CudaStep::RouterNorm(_)
+            | CudaStep::GemmCol64(_)
+            | CudaStep::BiasAdd(_) => Ok(()),
+        }
+    }
+
+    /// The group of the affine bank weight `ix` is, read off the tape's affine expert steps that
+    /// name it; `None` when none does (a dense bundle).
+    fn affine_group_of(&self, ix: WeightIx) -> Option<u32> {
+        self.steps.iter().find_map(|s| {
+            if let CudaStep::ExpertGemmAffine(ExpertGemmAffineBf16 { bundle, group, .. })
+            | CudaStep::ExpertGemvAffine(ExpertGemvAffineBf16 { bundle, group, .. }) = *s
+                && bundle == ix
+            {
+                return Some(group);
+            }
+            None
+        })
+    }
+
+    /// Weight `ix`, which the `step`-th step reads as an affine buffer of `want` bytes, is
+    /// declared exactly that: a buffer declared larger is not an affine entry of the step's
+    /// form. An index the tape lacks is `WeightIndex`, checked with every step's weight.
+    fn affine_weight_is(
+        &self,
+        step: usize,
+        ix: WeightIx,
+        want: Option<u64>,
+    ) -> Result<(), TapeError> {
+        match self.weight_bytes.get(ix.0 as usize) {
+            Some(&declared) if Some(declared) != want => Err(TapeError::AffineWeight {
+                step,
+                ix: ix.0,
+                declared,
+                want,
+            }),
+            Some(_) | None => Ok(()),
+        }
+    }
+
     /// A one-row kernel's step (the GEMV, the decode attention) is one row, in a one-row bucket:
     /// those kernels index no row past the first. Any other step passes.
     fn one_row(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
         let rows = match *s {
             CudaStep::Gemv(GemmBf16 { m, .. }) => m,
+            CudaStep::AffineGemv(AffineGemmBf16 { m, .. }) => m,
             CudaStep::AttnDecode(AttnPrefillBf16 { rows, .. }) => rows,
             _ => return Ok(()),
         };
@@ -3538,6 +3764,28 @@ mod tests {
                 offset: 4,
                 want: None,
             },
+            TapeError::AffineGroup {
+                step: 1,
+                n: 256,
+                k: 96,
+                group: 64,
+            },
+            TapeError::AffineWeight {
+                step: 1,
+                ix: 2,
+                declared: 4,
+                want: Some(8),
+            },
+            TapeError::AffineWeight {
+                step: 1,
+                ix: 2,
+                declared: 4,
+                want: None,
+            },
+            TapeError::ExpertWeight {
+                step: 1,
+                weight: MoeWeight::Bundle,
+            },
         ];
         for e in &all {
             match e {
@@ -3584,7 +3832,10 @@ mod tests {
                 | TapeError::MoeRegionMismatch { .. }
                 | TapeError::MoeScratchTouched { .. }
                 | TapeError::BiasShape { .. }
-                | TapeError::RouteBiasOffset { .. } => {}
+                | TapeError::RouteBiasOffset { .. }
+                | TapeError::AffineGroup { .. }
+                | TapeError::AffineWeight { .. }
+                | TapeError::ExpertWeight { .. } => {}
             }
         }
         all

@@ -219,8 +219,9 @@ const SPYRE_CAPABLE: &[&str] = &["llama", "granite", "gemma4", "gemma4-moe"];
 /// panics too; build `model/qwen3.6-35b-a3b`. gemma4-moe's tiny configs (`-class-tiny`,
 /// `-parity-tiny*`: GEMMs off the tiles, head dims 64 and 128) are refused the same way, so the
 /// arch-wide `model/gemma4-moe` panics; build `model/gemma-4-26b-a4b-it`. glm4-moe's configs are
-/// all 3-bit MLX affine, so every glm stem, `model/glm-4.5-air` too, panics at expansion today
-/// ("a GEMM over a Affine weight"): CUDA builds glm only once #948 adds its 4-bit affine steps.
+/// all 3-bit MLX affine, which CUDA refuses by name ("it is 3-bit at group 64"), so a bare glm
+/// stem, `model/glm-4.5-air` too, panics at expansion: build
+/// `model/glm-4.5-air,quant/mlx-affine-b4-g64-qembed` on CUDA (#948).
 ///
 /// Must agree with src/lib.rs gates; an arch selected under `cuda` but not listed here is refused
 /// by name below rather than silently dropped.

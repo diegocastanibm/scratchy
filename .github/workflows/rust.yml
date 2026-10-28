@@ -91,12 +91,14 @@ jobs:
           cargo clippy -p scratchy-models --features cuda,qwen3.5-9b-text-only --all-targets -- -D warnings
           cargo clippy -p scratchy-models --features cuda,qwen3.6-35b-a3b --all-targets -- -D warnings
           cargo clippy -p scratchy-models --features cuda,gemma-4-26b-a4b-it --all-targets -- -D warnings
+          cargo clippy -p scratchy-models --features cuda,glm-4.5-air,scratchy-quantizations/mlx-affine-b4-g64-qembed --all-targets -- -D warnings
           cargo test -p scratchy-target-cuda -p scratchy-target-cuda-compiler
           cargo test -p scratchy-target-cuda --test kernels_use_thunderkittens
           cargo test -p scratchy-models --features cuda,qwen3.5-0.8b --test cuda_tapes
           cargo test -p scratchy-models --features cuda,qwen3.5-9b-text-only --test cuda_tapes_9b
           cargo test -p scratchy-models --features cuda,qwen3.6-35b-a3b --test cuda_tapes_35b
           cargo test -p scratchy-models --features cuda,gemma-4-26b-a4b-it --test cuda_tapes_gemma4
+          cargo test -p scratchy-models --features cuda,glm-4.5-air,scratchy-quantizations/mlx-affine-b4-g64-qembed --test cuda_tapes_glm4
 
       # The multi-node control plane, the rank rendezvous and the channel
       # that carries `ControlMessage` to followers, is plain TCP + serde: no

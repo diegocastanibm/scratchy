@@ -481,7 +481,9 @@ fn load_checks() {
             Some(
                 CudaWeight::Bf16 { .. }
                 | CudaWeight::GdnBundle { .. }
-                | CudaWeight::MoeBundle { .. },
+                | CudaWeight::MoeBundle { .. }
+                | CudaWeight::Affine { .. }
+                | CudaWeight::MoeBundleAffine { .. },
             )
             | None => None,
         })

@@ -235,6 +235,12 @@ fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
             CudaStep::RouterNorm(_) => "RouterNorm",
             CudaStep::GemmCol64(_) => "GemmCol64",
             CudaStep::BiasAdd(_) => "BiasAdd",
+            CudaStep::AffineGemm(_) => "AffineGemm",
+            CudaStep::AffineGemmCol64(_) => "AffineGemmCol64",
+            CudaStep::AffineGemv(_) => "AffineGemv",
+            CudaStep::AffineEmbed(_) => "AffineEmbed",
+            CudaStep::ExpertGemmAffine(_) => "ExpertGemmAffine",
+            CudaStep::ExpertGemvAffine(_) => "ExpertGemvAffine",
         };
         *h.entry(kind).or_default() += 1;
         match step {
@@ -525,6 +531,9 @@ fn the_weight_table_names_the_checkpoints_tensors() {
             CudaWeight::ExpertBank { gate_up, down, .. } => vec![gate_up, down],
             CudaWeight::GdnBundle { .. } | CudaWeight::MoeBundle { .. } => {
                 panic!("weight {ix}: Gemma has no Qwen bundle")
+            }
+            CudaWeight::Affine { .. } | CudaWeight::MoeBundleAffine { .. } => {
+                panic!("weight {ix}: an affine weight in a dense model")
             }
         };
         for t in tensors {

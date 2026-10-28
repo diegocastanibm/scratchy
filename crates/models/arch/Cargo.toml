@@ -850,6 +850,14 @@ required-features = ["cuda", "qwen3.6-35b-a3b"]
 name = "cuda_tapes_gemma4"
 required-features = ["cuda", "gemma-4-26b-a4b-it"]
 
+# GLM-4.5-Air's emitted CUDA tapes at its MLX 4-bit g64 variant (#948): its affine steps, affine
+# weight table (60,139,821,568 device bytes) and MoE scratch, checked with no toolchain. The new
+# steps have no kernels yet (#949, #950). The preset is a dependency feature, which Cargo takes in
+# `required-features`.
+[[test]]
+name = "cuda_tapes_glm4"
+required-features = ["cuda", "glm-4.5-air", "scratchy-quantizations/mlx-affine-b4-g64-qembed"]
+
 # Gemma 4 26B-A4B's whole-model synthetic-weight forward on the H100 (#925): the qwen checks (a)-(o)
 # where they apply, plus the sliding window's (p)-(r), in its own body
 # (tests/common/cuda_prefill_gemma4_body.rs). Needs nvcc to build, and an H100 and about 51 GB of

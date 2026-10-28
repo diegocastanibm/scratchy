@@ -286,3 +286,79 @@ pub fn glm_attn_unbiased(m: u32) -> LoweredDecode {
     l.bindings[11] = SourceBinding::PrefixV { layer: 0 };
     l
 }
+
+// ── GLM-4.5-Air's MLX affine 4-bit g64 (#948) ──────────────────────
+
+use scratchy_subtile::lower::{AffineInt4, ExpertQuant};
+use scratchy_target_cuda_compiler::canonical::CudaAffine;
+
+/// The MLX group along K of every affine weight: 64 input elements share a scale and a bias.
+pub const GROUP: u32 = 64;
+
+/// GLM's facts for its 4-bit checkpoint: [`GLM_MOE_FACTS`] with its affine weights lowered, the
+/// embedding table packed 4-bit at [`GROUP`], every router dense.
+pub const GLM_AFFINE_FACTS: CudaModelFacts = CudaModelFacts {
+    affine: CudaAffine::Lower {
+        embed: Some((4, GROUP)),
+        router: None,
+    },
+    ..GLM_MOE_FACTS
+};
+
+/// [`GLM_AFFINE_FACTS`] with the token-embedding table of a `vocab`-row vocabulary: the forward's
+/// input is token ids, and its first step the affine embed.
+pub const fn glm_affine_embed_facts(vocab: u32) -> CudaModelFacts {
+    CudaModelFacts {
+        embed: Some(scratchy_target_cuda_compiler::canonical::CudaEmbedFacts { vocab }),
+        ..GLM_AFFINE_FACTS
+    }
+}
+
+/// [`glm_moe`] with its routed experts MLX-affine at `(bits, group)`: each `ExpertMatmul` binds
+/// the bundle as its weight and its scale (operands 2 and 3), as the bridge emits an affine bank
+/// (`to_wavefront.rs`, `bank = |_| (w, w)`).
+pub fn glm_moe_affine(m: u32, bits: u32, group: u32) -> LoweredDecode {
+    let mut l = glm_moe(m);
+    for op in &mut l.input.ops {
+        if let SubOp::ExpertMatmul { weight, .. } = &mut op.op {
+            *weight = ExpertWeight::Affine(ExpertQuant::declared(group, bits));
+            op.inputs.push(InputRef::Ext(1));
+        }
+    }
+    l
+}
+
+/// The `n`s of the affine GEMM chain: a GLM-shaped attention and MLP widths, each a multiple of 64
+/// (the 64-column GEMM's above one row) and the first a multiple of 256 (the tiled GEMM's).
+pub const AFFINE_CHAIN_NS: [u32; 3] = [512, 384, 256];
+
+/// A GLM-shaped chain of affine GEMMs at `m` rows over the embedded hidden of width [`H`]: `x →
+/// W0 (512) → W1 (384) → W2 (256)`, each weight MLX-affine at `(bits, group)`.
+pub fn glm_affine_chain(m: u32, bits: u32, group: u32) -> LoweredDecode {
+    let mut k = H;
+    let mut sources = vec![SourceShape { rows: m, cols: H }];
+    let mut ops = Vec::new();
+    for (i, &n) in AFFINE_CHAIN_NS.iter().enumerate() {
+        sources.push(SourceShape { rows: k, cols: n });
+        let affine = AffineInt4::mint(bits, group, k).expect("the group tiles k");
+        let act = match i {
+            0 => InputRef::Ext(0),
+            i => InputRef::Op(i - 1),
+        };
+        ops.push(OpDesc {
+            op: SubOp::MatmulTile {
+                n,
+                weight: GemmWeight::Affine { affine },
+            },
+            m,
+            inputs: vec![act, InputRef::Ext(i + 1)],
+        });
+        k = n;
+    }
+    with_hidden(LoweringInput {
+        exported: None,
+        result: ops.len() - 1,
+        sources,
+        ops,
+    })
+}

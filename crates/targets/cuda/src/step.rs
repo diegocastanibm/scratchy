@@ -115,7 +115,212 @@ pub enum CudaStep {
     /// `x + bias`, the bias broadcast over the rows (GLM's q, k and v biases), lowered from
     /// `Elementwise(BiasAdd)`. Its kernel is #938's 14b: the worker refuses it until then.
     BiasAdd(BiasAddBf16),
+    /// The GEMM over an MLX-affine weight, lowered from `SubOp::MatmulTile` over a
+    /// `GemmWeight::Affine` when [`Self::Gemm`] would take its shape. Its bf16 twin is
+    /// [`Self::Gemm`]: on the host-dequantized weight it must equal it bit for bit. Its kernel is
+    /// #949's: the worker refuses it until then.
+    AffineGemm(AffineGemmBf16),
+    /// [`Self::AffineGemm`] on 64-column tiles, when [`Self::GemmCol64`] would take its shape. Its
+    /// bf16 twin is [`Self::GemmCol64`]. Its kernel is #949's.
+    AffineGemmCol64(AffineGemmBf16),
+    /// [`Self::AffineGemm`] of one row, when [`Self::Gemv`] would take its shape. Its bf16 twin is
+    /// [`Self::Gemv`]. Its kernel is #949's.
+    AffineGemv(AffineGemmBf16),
+    /// The token-embedding gather from an MLX-affine table, the forward's first step when the
+    /// checkpoint ships its embedding packed: [`Self::Embed`]'s place and operands. It has no bf16
+    /// twin: each row is the host dequant of the table's row. Its kernel is #949's.
+    AffineEmbed(AffineEmbedBf16),
+    /// [`Self::ExpertGemm`] over an MLX-affine bank ([`MoeWeight::AffineBank`]), lowered from
+    /// `SubOp::ExpertMatmul` over an `ExpertWeight::Affine` of a sorted bucket. Its bf16 twin is
+    /// [`Self::ExpertGemm`]. Its kernel is #950's: the worker refuses it until then.
+    ExpertGemmAffine(ExpertGemmAffineBf16),
+    /// [`Self::ExpertGemv`] over an MLX-affine bank, the same of a gathered bucket. Its bf16 twin
+    /// is [`Self::ExpertGemv`]. Its kernel is #950's.
+    ExpertGemvAffine(ExpertGemvAffineBf16),
 }
+
+/// The packed width of every affine step: 4-bit codes, 8 to a little-endian u32 word, code `j` of
+/// a word in its bits `4j .. 4j + 4` (MLX's packing).
+pub const AFFINE_BITS: u32 = 4;
+/// Bytes of one packed word.
+const PACKED_WORD_BYTES: u64 = 4;
+/// Codes per packed word.
+const CODES_PER_WORD: u32 = 32 / AFFINE_BITS;
+
+// Every form CUDA takes is of the one packed width the steps' byte counts are written for.
+const _: () = {
+    let forms = crate::op_abi::CUDA_AFFINE_FORMS;
+    let mut i = 0;
+    while i < forms.len() {
+        assert!(forms[i].0 == AFFINE_BITS);
+        i += 1;
+    }
+};
+
+/// `C[m, n] = A[m, k] · W[n, k]ᵀ`, `W[n, j] = scale[g, n] · q[n, j] + bias[g, n]` for `g = j /
+/// group`, bf16 in and out: [`GemmBf16`] with an MLX-affine `B`. `b` is an [`affine_weight`]
+/// buffer: the `[n, k/8]` u32 codes as on disk, then the `[k/group, n]` bf16 scales and biases,
+/// group-major (each group's `n` output channels contiguous). `k` is a non-zero multiple of
+/// `group`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct AffineGemmBf16 {
+    pub a: ArenaOffset,
+    pub b: WeightIx,
+    pub c: ArenaOffset,
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub group: u32,
+}
+
+impl AffineGemmBf16 {
+    /// The bf16 step of these operands, its `B` the dense `[n, k]` weight: the twin it must equal
+    /// on the host-dequantized weight.
+    pub const fn twin(&self) -> GemmBf16 {
+        GemmBf16 {
+            a: self.a,
+            b: self.b,
+            c: self.c,
+            m: self.m,
+            n: self.n,
+            k: self.k,
+        }
+    }
+}
+
+/// `out[r, :] = dequant(table[tokens[r], :])` for every one of the bucket's `rows`: [`EmbedBf16`]
+/// from an MLX-affine table. `table` is an [`affine_weight`] buffer of `vocab` rows of `hidden`
+/// with its scales and biases row-major (`[vocab, hidden/group]`): a gather reads one row's
+/// `hidden/group` scales contiguously. An id at or above `vocab` writes a `+0.0` row, as the bf16
+/// embed's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct AffineEmbedBf16 {
+    pub tokens: ArenaOffset,
+    pub table: WeightIx,
+    pub out: ArenaOffset,
+    pub rows: u32,
+    pub hidden: u32,
+    pub vocab: u32,
+    pub group: u32,
+}
+
+/// One MLX-affine weight's regions, each at a multiple of [`CUDA_ARENA_ALIGN`] from the buffer's
+/// start: the packed u32 codes, the bf16 scales and the bf16 biases, and the total.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AffineLayout {
+    pub weight: u64,
+    pub scales: u64,
+    pub biases: u64,
+    pub bytes: u64,
+}
+
+/// The regions of `rows` rows of `k` 4-bit codes, placed from byte `at`: the `rows · k/8` packed
+/// words, then `rows · k/group` bf16 scales and as many biases, each region at the next multiple
+/// of [`CUDA_ARENA_ALIGN`]. The scales' order (group-major or row-major) does not change their
+/// bytes. `None` when `group` is 0, `k` is not a multiple of `group` or of 8, or a byte count
+/// overflows `u64`.
+pub const fn affine_regions(at: u64, rows: u64, k: u32, group: u32) -> Option<AffineLayout> {
+    if group == 0 || !k.is_multiple_of(group) || !k.is_multiple_of(CODES_PER_WORD) {
+        return None;
+    }
+    let Some(weight) = at.checked_next_multiple_of(CUDA_ARENA_ALIGN) else {
+        return None;
+    };
+    let Some(words) = rows.checked_mul((k / CODES_PER_WORD) as u64) else {
+        return None;
+    };
+    let Some(packed) = words.checked_mul(PACKED_WORD_BYTES) else {
+        return None;
+    };
+    let Some(scales) = aligned_after(weight, packed) else {
+        return None;
+    };
+    let Some(groups) = rows.checked_mul((k / group) as u64) else {
+        return None;
+    };
+    let Some(per) = groups.checked_mul(CUDA_ACT_BYTES) else {
+        return None;
+    };
+    let Some(biases) = aligned_after(scales, per) else {
+        return None;
+    };
+    let Some(bytes) = biases.checked_add(per) else {
+        return None;
+    };
+    Some(AffineLayout {
+        weight,
+        scales,
+        biases,
+        bytes,
+    })
+}
+
+/// One MLX-affine `[n, k]` weight's buffer ([`affine_regions`] from byte 0): what an affine GEMM
+/// reads as its `B`, or the affine embed as its table (`n` the vocabulary, `k` the hidden).
+pub const fn affine_weight(n: u32, k: u32, group: u32) -> Option<AffineLayout> {
+    affine_regions(0, n as u64, k, group)
+}
+
+/// A GLM MoE layer's MLX-affine bundle, as the checkpoint's 11 tensors lay it out, each slab at a
+/// multiple of [`CUDA_ARENA_ALIGN`]: the router `[experts, hidden]` bf16 at byte 0 (so
+/// [`RouterLogitsBf16`] reads it unchanged), its f32 `[experts]` correction bias, then the gate,
+/// the up and the down projections, each its packed `[experts, n, k/8]` u32 codes and its
+/// `[experts, k/group, n]` bf16 scales and biases (group-major per expert), and the total. The
+/// gate and the up are separate slabs, as the checkpoint ships them (`switch_mlp.gate_proj`,
+/// `switch_mlp.up_proj`), not interleaved as [`moe_bundle`]'s fused `gate_up`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoeBundleAffine {
+    pub router: u64,
+    pub correction_bias: u64,
+    pub gate: AffineLayout,
+    pub up: AffineLayout,
+    pub down: AffineLayout,
+    pub bytes: u64,
+}
+
+/// [`MoeBundleAffine`] for one layer's geometry, or `None` when `group` does not tile both `hidden`
+/// and `inter` or a byte count overflows `u64`.
+pub const fn moe_bundle_affine(
+    experts: u32,
+    hidden: u32,
+    inter: u32,
+    group: u32,
+) -> Option<MoeBundleAffine> {
+    let Some(router) = bf16_bytes(experts, hidden) else {
+        return None;
+    };
+    let Some(correction_bias) = router.checked_next_multiple_of(CUDA_ARENA_ALIGN) else {
+        return None;
+    };
+    let Some(bias_end) = correction_bias.checked_add(experts as u64 * F32_BYTES) else {
+        return None;
+    };
+    let (e, h, i) = (experts as u64, hidden as u64, inter as u64);
+    let Some(gate) = affine_regions(bias_end, e * i, hidden, group) else {
+        return None;
+    };
+    let Some(up) = affine_regions(gate.bytes, e * i, hidden, group) else {
+        return None;
+    };
+    let Some(down) = affine_regions(up.bytes, e * h, inter, group) else {
+        return None;
+    };
+    Some(MoeBundleAffine {
+        router: 0,
+        correction_bias,
+        gate,
+        up,
+        down,
+        bytes: down.bytes,
+    })
+}
+
+// GLM-4.5-Air's bundle (128 experts, hidden 4096, expert width 1408, group 64) is exactly its
+// checkpoint's 11 tensors: every slab is already a multiple of 256 bytes, so there is no padding.
+const _: () = assert!(match moe_bundle_affine(128, 4096, 1408, 64) {
+    Some(b) => b.bytes == 1_246_757_376,
+    None => false,
+});
 
 /// The bias add's `cols` is a non-zero multiple of this (one 16-byte vector of 8 bf16), `rows`
 /// non-zero, and `rows · cols` at most `i32::MAX`.
@@ -804,26 +1009,35 @@ pub enum MoeWeight {
     /// expert bank ([`expert_bank`]: every expert's fused gate and up, then every expert's down,
     /// with no router).
     Own,
+    /// GLM's MLX-affine bundle ([`moe_bundle_affine`]): the dense router at byte 0, its
+    /// correction bias, then the packed gate, up and down. Only the affine expert steps read its
+    /// experts; a router step reads its first `[experts, hidden]` bf16.
+    AffineBank,
 }
 
 impl MoeWeight {
-    /// The layout an expert step reads its slab from: the bundle's, or the bank's (its gate and
-    /// up at byte 0). `None` on overflow.
+    /// The layout a dense expert step reads its slab from: the bundle's, or the bank's (its gate
+    /// and up at byte 0). `None` on overflow, and for an affine bank, which has no dense layout:
+    /// `CudaTape::validate` refuses a dense expert step over one (`TapeError::ExpertWeight`)
+    /// before it sizes the step.
     pub const fn experts(self, experts: u32, hidden: u32, inter: u32) -> Option<MoeBundle> {
         match self {
             Self::Bundle => moe_bundle(experts, hidden, inter),
             Self::Own => expert_bank(experts, hidden, inter),
+            Self::AffineBank => None,
         }
     }
 
-    /// The bytes a router step reads its weight as: the whole bundle, or the projection.
+    /// The bytes a router step reads its weight as: the whole bundle, the projection, or an
+    /// affine bank's router, its first `[experts, hidden]` bf16 (the bank's own bytes need its
+    /// group, which the router step does not carry: its expert steps declare them).
     pub const fn router_bytes(self, experts: u32, hidden: u32, inter: u32) -> Option<u64> {
         match self {
             Self::Bundle => match moe_bundle(experts, hidden, inter) {
                 Some(b) => Some(b.bytes),
                 None => None,
             },
-            Self::Own => bf16_bytes(experts, hidden),
+            Self::Own | Self::AffineBank => bf16_bytes(experts, hidden),
         }
     }
 }
@@ -1017,6 +1231,109 @@ impl ExpertGemvBf16 {
     /// `(n, k)` of the projection.
     pub const fn n_k(&self) -> (u32, u32) {
         self.proj.n_k(self.hidden, self.inter)
+    }
+}
+
+impl ExpertProjection {
+    /// The projection's slab of an affine bundle of `bundle`'s layout: its packed codes, scales
+    /// and biases, each `[experts, …]` with expert `e`'s part at `e · (part's bytes / experts)`.
+    pub const fn affine_slab(self, bundle: MoeBundleAffine) -> AffineLayout {
+        match self {
+            Self::Gate => bundle.gate,
+            Self::Up => bundle.up,
+            Self::Down => bundle.down,
+        }
+    }
+}
+
+/// [`ExpertGemmBf16`] over an MLX-affine bank: `B_e` expert `e`'s `[n, k]` of the bank's `proj`
+/// slab dequantized as [`AffineGemmBf16`]'s, `group` the bank's. `weight` is
+/// [`MoeWeight::AffineBank`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ExpertGemmAffineBf16 {
+    pub a: ArenaOffset,
+    pub bundle: WeightIx,
+    pub weight: MoeWeight,
+    pub proj: ExpertProjection,
+    pub offsets: ArenaOffset,
+    pub tile_expert: ArenaOffset,
+    pub c: ArenaOffset,
+    pub max_tiles: u32,
+    pub experts: u32,
+    pub hidden: u32,
+    pub inter: u32,
+    /// As [`ExpertGemmBf16::n_tile`]: 64 for GLM's gate and up (1408), 256 for its down (4096).
+    pub n_tile: u32,
+    pub group: u32,
+}
+
+impl ExpertGemmAffineBf16 {
+    /// `(n, k)` of the projection.
+    pub const fn n_k(&self) -> (u32, u32) {
+        self.proj.n_k(self.hidden, self.inter)
+    }
+
+    /// The bf16 step of these operands over the dense bundle ([`moe_bundle`]): the twin it must
+    /// equal on the host-dequantized bank.
+    pub const fn twin(&self) -> ExpertGemmBf16 {
+        ExpertGemmBf16 {
+            a: self.a,
+            bundle: self.bundle,
+            weight: MoeWeight::Bundle,
+            proj: self.proj,
+            offsets: self.offsets,
+            tile_expert: self.tile_expert,
+            c: self.c,
+            max_tiles: self.max_tiles,
+            experts: self.experts,
+            hidden: self.hidden,
+            inter: self.inter,
+            n_tile: self.n_tile,
+        }
+    }
+}
+
+/// [`ExpertGemvBf16`] over an MLX-affine bank, as [`ExpertGemmAffineBf16`] is the grouped GEMM's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ExpertGemvAffineBf16 {
+    pub a: ArenaOffset,
+    pub rows: PairRows,
+    pub bundle: WeightIx,
+    pub weight: MoeWeight,
+    pub proj: ExpertProjection,
+    pub topk_idx: ArenaOffset,
+    pub c: ArenaOffset,
+    pub m: u32,
+    pub top_k: u32,
+    pub experts: u32,
+    pub hidden: u32,
+    pub inter: u32,
+    pub group: u32,
+}
+
+impl ExpertGemvAffineBf16 {
+    /// `(n, k)` of the projection.
+    pub const fn n_k(&self) -> (u32, u32) {
+        self.proj.n_k(self.hidden, self.inter)
+    }
+
+    /// The bf16 step of these operands over the dense bundle ([`moe_bundle`]): the twin it must
+    /// equal on the host-dequantized bank.
+    pub const fn twin(&self) -> ExpertGemvBf16 {
+        ExpertGemvBf16 {
+            a: self.a,
+            rows: self.rows,
+            bundle: self.bundle,
+            weight: MoeWeight::Bundle,
+            proj: self.proj,
+            topk_idx: self.topk_idx,
+            c: self.c,
+            m: self.m,
+            top_k: self.top_k,
+            experts: self.experts,
+            hidden: self.hidden,
+            inter: self.inter,
+        }
     }
 }
 
@@ -1765,6 +2082,118 @@ impl CudaStep {
                     in_place: false,
                 })
             }
+            // The bf16 GEMM's activation and output, and the whole affine weight buffer.
+            Self::AffineGemm(g) | Self::AffineGemmCol64(g) | Self::AffineGemv(g) => {
+                let Some(StepExtents { reads, writes, .. }) = Self::Gemm(g.twin()).extents() else {
+                    return None;
+                };
+                let Some(w) = affine_weight(g.n, g.k, g.group) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads,
+                    writes,
+                    second_write: None,
+                    weight: Some(WeightRead {
+                        ix: g.b,
+                        bytes: w.bytes,
+                    }),
+                    kv: None,
+                    gdn: None,
+                    in_place: false,
+                })
+            }
+            Self::AffineEmbed(AffineEmbedBf16 {
+                tokens,
+                table,
+                out,
+                rows,
+                hidden,
+                vocab,
+                group,
+            }) => {
+                let (Some(ob), Some(tb)) = (
+                    bf16_bytes(rows, hidden),
+                    affine_weight(vocab, hidden, group),
+                ) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [Some(span(tokens, u32_bytes(rows))), None, None, None],
+                    writes: span(out, ob),
+                    second_write: None,
+                    weight: Some(WeightRead {
+                        ix: table,
+                        bytes: tb.bytes,
+                    }),
+                    kv: None,
+                    gdn: None,
+                    in_place: false,
+                })
+            }
+            // The dense twin's arena spans, over the whole affine bank.
+            Self::ExpertGemmAffine(g) => {
+                let rows = g.max_tiles as u64 * crate::op_abi::CUDA_EXPERT_TILE_ROWS as u64;
+                let (n, k) = g.n_k();
+                let (Some(ab), Some(cb), Some(bu)) = (
+                    (rows * k as u64).checked_mul(CUDA_ACT_BYTES),
+                    (rows * n as u64).checked_mul(CUDA_ACT_BYTES),
+                    moe_bundle_affine(g.experts, g.hidden, g.inter, g.group),
+                ) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [
+                        Some(span(g.a, ab)),
+                        Some(span(g.offsets, u32_bytes(g.experts + 1))),
+                        Some(span(g.tile_expert, u32_bytes(g.max_tiles))),
+                        None,
+                    ],
+                    writes: span(g.c, cb),
+                    second_write: None,
+                    weight: Some(WeightRead {
+                        ix: g.bundle,
+                        bytes: bu.bytes,
+                    }),
+                    kv: None,
+                    gdn: None,
+                    in_place: false,
+                })
+            }
+            Self::ExpertGemvAffine(g) => {
+                let Some(pairs) = g.m.checked_mul(g.top_k) else {
+                    return None;
+                };
+                let a_rows = match g.rows {
+                    PairRows::Token => g.m,
+                    PairRows::Pair => pairs,
+                };
+                let (n, k) = g.n_k();
+                let (Some(ab), Some(cb), Some(bu)) = (
+                    bf16_bytes(a_rows, k),
+                    bf16_bytes(pairs, n),
+                    moe_bundle_affine(g.experts, g.hidden, g.inter, g.group),
+                ) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [
+                        Some(span(g.a, ab)),
+                        Some(span(g.topk_idx, u32_bytes(pairs))),
+                        None,
+                        None,
+                    ],
+                    writes: span(g.c, cb),
+                    second_write: None,
+                    weight: Some(WeightRead {
+                        ix: g.bundle,
+                        bytes: bu.bytes,
+                    }),
+                    kv: None,
+                    gdn: None,
+                    in_place: false,
+                })
+            }
         }
     }
 }
@@ -1869,6 +2298,12 @@ impl CudaStep {
             Self::RouterLogits(RouterLogitsBf16 { bundle, .. }) => Some(bundle),
             Self::ExpertGemm(ExpertGemmBf16 { bundle, .. })
             | Self::ExpertGemv(ExpertGemvBf16 { bundle, .. }) => Some(bundle),
+            Self::AffineGemm(AffineGemmBf16 { b, .. })
+            | Self::AffineGemmCol64(AffineGemmBf16 { b, .. })
+            | Self::AffineGemv(AffineGemmBf16 { b, .. }) => Some(b),
+            Self::AffineEmbed(AffineEmbedBf16 { table, .. }) => Some(table),
+            Self::ExpertGemmAffine(ExpertGemmAffineBf16 { bundle, .. })
+            | Self::ExpertGemvAffine(ExpertGemvAffineBf16 { bundle, .. }) => Some(bundle),
             Self::Add(_)
             | Self::SiluMul(_)
             | Self::Rope(_)

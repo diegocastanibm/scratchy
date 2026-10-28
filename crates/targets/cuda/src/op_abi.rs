@@ -302,6 +302,17 @@ const _: () = assert!(CUDA_EXPERT_TILE_ROWS == crate::step::GEMM_BF16_TILE.0);
 /// their rules and refusals are the tiled GEMM's.
 pub const CUDA_GEMM_COL64_ARCHS: &[&str] = &["gemma4-moe", "glm4-moe"];
 
+// ── MLX-affine weights ──────────────────────────────────────────────
+
+/// The MLX-affine forms CUDA has steps for, as `(bits, group)`: 4-bit codes, one bf16 scale and
+/// bias per 64 input elements (GLM-4.5-Air's MLX 4-bit). A weight of any other form is refused by
+/// name (`GemmWeightRule::AffineForm`, `MoeShapeRule::AffineForm`): a 3-bit or a group-128 one.
+pub const CUDA_AFFINE_FORMS: &[(u32, u32)] = &[(4, 64)];
+
+/// The archs whose MLX-affine tapes CUDA lowers: GLM-4.5-Air. Every other arch's affine GEMM and
+/// expert bank are refused as dense-only kernels refuse them, so its refusals are unchanged.
+pub const CUDA_AFFINE_ARCHS: &[&str] = &["glm4-moe"];
+
 /// How many columns one graph node covers: all of them. Tiling is a target fact; spyre tiles to
 /// 128-column pages because its substrate requires it, while CUDA's kernels — like metal's — take
 /// a whole `RmsNorm` or a whole matmul, so the graph is built from whole ops.
@@ -379,6 +390,13 @@ mod tests {
     #[test]
     fn the_64_column_gemm_archs() {
         assert_eq!(CUDA_GEMM_COL64_ARCHS, ["gemma4-moe", "glm4-moe"]);
+    }
+
+    /// The affine facts: 4-bit at group 64, GLM-4.5-Air's arch only.
+    #[test]
+    fn the_affine_facts() {
+        assert_eq!(CUDA_AFFINE_FORMS, [(4, 64)]);
+        assert_eq!(CUDA_AFFINE_ARCHS, ["glm4-moe"]);
     }
 
     /// The MoE facts: two dense bundles with a grouped GEMM, at 128 or 256 experts, sorted from

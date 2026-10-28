@@ -12,8 +12,10 @@
 //! [`check`] checks every entry against the checkpoint's header before anything is allocated, and
 //! [`stage`] makes one entry's host bytes. The upload is `runtime::load_weights`, under `nvcc`.
 //!
-//! Every conversion is exact: a bf16 tensor is uploaded byte for byte, and a GDN bundle's pieces
-//! are widened to f32, which loses nothing from bf16 or f32.
+//! Every conversion is exact: a bf16 tensor is uploaded byte for byte, a GDN bundle's pieces
+//! are widened to f32, which loses nothing from bf16 or f32, and an MLX-affine weight's packed
+//! codes are uploaded byte for byte, its bf16 scales and biases permuted (group-major), never
+//! converted.
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +23,9 @@ use scratchy_layers::weights::GpuWeights;
 use scratchy_tensors::{DType, DeviceAllocator, PoolMemory};
 use serde::Serialize;
 
-use crate::step::{expert_bank, gdn_bundle, moe_bundle};
+use crate::step::{
+    AffineLayout, affine_weight, expert_bank, gdn_bundle, moe_bundle, moe_bundle_affine,
+};
 use crate::tape::CudaTape;
 
 /// How one weight index is filled from the checkpoint.
@@ -72,12 +76,70 @@ pub enum CudaWeight {
         hidden: u32,
         inter: u32,
     },
+    /// One MLX-affine `[n, k]` weight (`step::affine_weight`), one device buffer from three
+    /// checkpoint tensors: `weight` the packed `[n, k/8]` u32 codes (`{prefix}.weight`), uploaded
+    /// byte for byte, then `scales` and `biases` (`{prefix}.scales`, `{prefix}.biases`), each
+    /// `[n, k/group]` bf16 on disk, in `layout`'s order.
+    Affine {
+        weight: &'static str,
+        scales: &'static str,
+        biases: &'static str,
+        n: u32,
+        k: u32,
+        group: u32,
+        layout: ScaleLayout,
+    },
+    /// One GLM MoE layer's MLX-affine bundle (`step::moe_bundle_affine`), from its 11 checkpoint
+    /// tensors: the dense bf16 `router` `[experts, hidden]` and its f32 `correction_bias`
+    /// `[experts]`, each uploaded byte for byte, then the gate, up and down projections' packed
+    /// codes, uploaded byte for byte, and their bf16 scales and biases, group-major per expert.
+    MoeBundleAffine {
+        router: &'static str,
+        correction_bias: &'static str,
+        gate: AffineTensors,
+        up: AffineTensors,
+        down: AffineTensors,
+        experts: u32,
+        hidden: u32,
+        inter: u32,
+        group: u32,
+    },
+}
+
+/// The three checkpoint tensors of one MLX-affine projection: its packed codes, scales and biases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct AffineTensors {
+    pub weight: &'static str,
+    pub scales: &'static str,
+    pub biases: &'static str,
+}
+
+/// The order an affine weight's scales and biases are laid out in on the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum ScaleLayout {
+    /// `[k/group, n]`: each group's `n` output channels contiguous, so a GEMM step over one group
+    /// reads its scales as one run (TMA maps it; the checkpoint's `[n, k/group]` rows are `k/group
+    /// · 2` bytes apart, 44 at `k` = 1408, no multiple of 16). Transposed at load. Every GEMM and
+    /// GEMV weight.
+    GroupMajor,
+    /// `[n, k/group]`, the checkpoint's own order: a gather reads one row's `k/group` scales
+    /// contiguously. The embedding table.
+    RowMajor,
 }
 
 /// The dtypes a dense tensor may have on disk: bf16 only, never converted.
 const DENSE_DTYPES: &[DType] = &[DType::BF16];
 /// The dtypes a GDN bundle's piece may have on disk: both widen to f32 exactly.
 const GDN_DTYPES: &[DType] = &[DType::BF16, DType::F32];
+/// The dtype of an affine weight's packed codes on disk.
+const PACKED_DTYPES: &[DType] = &[DType::U32];
+/// The dtype of an affine weight's scales and biases on disk: bf16 only, as the kernels read
+/// them (an f16 checkpoint is refused, never converted).
+const SCALE_DTYPES: &[DType] = &[DType::BF16];
+/// The dtype of a correction bias on disk.
+const BIAS_DTYPES: &[DType] = &[DType::F32];
+/// Codes per packed u32 word: 4-bit codes, as every form `op_abi::CUDA_AFFINE_FORMS` names.
+const CODES_PER_WORD: u32 = 32 / crate::step::AFFINE_BITS;
 
 /// One checkpoint tensor an entry reads, the dtypes it may have, and the shape it must have.
 struct Read {
@@ -94,6 +156,8 @@ impl CudaWeight {
             Self::GdnBundle { conv1d, .. } => conv1d,
             Self::MoeBundle { router, .. } => router,
             Self::ExpertBank { gate_up, .. } => gate_up,
+            Self::Affine { weight, .. } => weight,
+            Self::MoeBundleAffine { router, .. } => router,
         }
     }
 
@@ -163,6 +227,52 @@ impl CudaWeight {
                     read(down, &[experts, hidden, inter]),
                 ]
             }
+            Self::Affine {
+                weight,
+                scales,
+                biases,
+                n,
+                k,
+                group,
+                ..
+            } => affine_reads(
+                AffineTensors {
+                    weight,
+                    scales,
+                    biases,
+                },
+                &[n],
+                k,
+                group,
+            ),
+            Self::MoeBundleAffine {
+                router,
+                correction_bias,
+                gate,
+                up,
+                down,
+                experts,
+                hidden,
+                inter,
+                group,
+            } => {
+                let mut reads = vec![
+                    Read {
+                        tensor: router,
+                        accepted: DENSE_DTYPES,
+                        shape: vec![u64::from(experts), u64::from(hidden)],
+                    },
+                    Read {
+                        tensor: correction_bias,
+                        accepted: BIAS_DTYPES,
+                        shape: vec![u64::from(experts)],
+                    },
+                ];
+                reads.extend(affine_reads(gate, &[experts, inter], hidden, group));
+                reads.extend(affine_reads(up, &[experts, inter], hidden, group));
+                reads.extend(affine_reads(down, &[experts, hidden], inter, group));
+                reads
+            }
         }
     }
 
@@ -189,8 +299,45 @@ impl CudaWeight {
                 inter,
                 ..
             } => expert_bank(experts, hidden, inter).map(|b| b.bytes),
+            Self::Affine { n, k, group, .. } => affine_weight(n, k, group).map(|w| w.bytes),
+            Self::MoeBundleAffine {
+                experts,
+                hidden,
+                inter,
+                group,
+                ..
+            } => moe_bundle_affine(experts, hidden, inter, group).map(|b| b.bytes),
         }
     }
+}
+
+/// The reads of one affine projection of `rows` (its leading dims, `[n]` or `[experts, n]`) by
+/// `k`: the packed codes `[.., k/8]` u32, then the scales and biases `[.., k/group]` bf16, the
+/// same shape and dtype.
+fn affine_reads(t: AffineTensors, rows: &[u32], k: u32, group: u32) -> Vec<Read> {
+    let shape = |last: u32| {
+        (rows.iter().chain([&last]))
+            .map(|&d| u64::from(d))
+            .collect::<Vec<_>>()
+    };
+    let groups = k.checked_div(group).unwrap_or(0);
+    vec![
+        Read {
+            tensor: t.weight,
+            accepted: PACKED_DTYPES,
+            shape: shape(k / CODES_PER_WORD),
+        },
+        Read {
+            tensor: t.scales,
+            accepted: SCALE_DTYPES,
+            shape: shape(groups),
+        },
+        Read {
+            tensor: t.biases,
+            accepted: SCALE_DTYPES,
+            shape: shape(groups),
+        },
+    ]
 }
 
 /// Why a checkpoint cannot fill a weight table. Every arm but [`LoadError::Upload`] is found
@@ -213,6 +360,14 @@ pub enum LoadError {
     /// projections as tensors of their own (`experts.{e}.gate_proj.weight`), a form this loader does
     /// not take.
     PerExpertTensors { ix: usize, tensor: &'static str },
+    /// Weight `ix` is a dense MLX-affine bundle's router, and the checkpoint ships `scales` beside
+    /// it: the table reads the router dense (`TargetMoeAffine::router` is `None`), and the
+    /// checkpoint quantized it.
+    QuantizedRouter {
+        ix: usize,
+        router: &'static str,
+        scales: String,
+    },
     /// Weight `ix` reads `tensor`, which is `got` on disk; it may be one of `accepted`.
     Dtype {
         ix: usize,
@@ -262,6 +417,11 @@ impl std::fmt::Display for LoadError {
             Self::Missing { ix, tensor } => {
                 write!(f, "weight {ix}: the checkpoint has no tensor {tensor}")
             }
+            Self::QuantizedRouter { ix, router, scales } => write!(
+                f,
+                "weight {ix}: the table reads the router {router} dense bf16, and the checkpoint \
+                 ships {scales} beside it: the router is quantized on disk"
+            ),
             Self::PerExpertTensors { ix, tensor } => write!(
                 f,
                 "weight {ix}: the checkpoint has no fused expert tensor {tensor}; it stores each \
@@ -357,6 +517,17 @@ fn check_tensors<A: DeviceAllocator>(
     entry: &CudaWeight,
     weights: &GpuWeights<A>,
 ) -> Result<(), LoadError> {
+    // The router of an affine bundle is read dense: a `.scales` beside its `.weight` says the
+    // checkpoint quantized it, which the table does not take.
+    if let CudaWeight::MoeBundleAffine { router, .. } = *entry {
+        let scales = format!(
+            "{}.scales",
+            router.strip_suffix(".weight").unwrap_or(router)
+        );
+        if weights.tensor_info(&scales).is_some() {
+            return Err(LoadError::QuantizedRouter { ix, router, scales });
+        }
+    }
     for Read {
         tensor,
         accepted,
@@ -549,6 +720,116 @@ pub fn stage<A: DeviceAllocator>(
                 packed.extend_from_slice(&bytes);
             }
             Ok(packed)
+        }
+        CudaWeight::Affine {
+            weight,
+            scales,
+            biases,
+            n,
+            k,
+            group,
+            layout,
+        } => {
+            let regions = affine_weight(n, k, group).ok_or(LoadError::Bytes {
+                ix,
+                tensor: Some(weight),
+                packed: u64::MAX,
+                declared: 0,
+            })?;
+            let mut packed = vec![0u8; regions.bytes as usize];
+            let t = AffineTensors {
+                weight,
+                scales,
+                biases,
+            };
+            let order = match layout {
+                ScaleLayout::GroupMajor => Some((1, n, k / group)),
+                ScaleLayout::RowMajor => None,
+            };
+            stage_affine(weights, &mut packed, regions, t, order, missing)?;
+            Ok(packed)
+        }
+        CudaWeight::MoeBundleAffine {
+            router,
+            correction_bias,
+            gate,
+            up,
+            down,
+            experts,
+            hidden,
+            inter,
+            group,
+        } => {
+            let layout =
+                moe_bundle_affine(experts, hidden, inter, group).ok_or(LoadError::Bytes {
+                    ix,
+                    tensor: Some(router),
+                    packed: u64::MAX,
+                    declared: 0,
+                })?;
+            let mut packed = vec![0u8; layout.bytes as usize];
+            // The router and the correction bias, byte for byte at their offsets.
+            for (tensor, at) in [
+                (router, layout.router),
+                (correction_bias, layout.correction_bias),
+            ] {
+                let (bytes, ..) =
+                    (weights.take_to_cpu_bytes(tensor)).map_err(|_| missing(tensor))?;
+                packed[at as usize..][..bytes.len()].copy_from_slice(&bytes);
+            }
+            // Each projection's scales group-major per expert: `[E, n, k/g]` to `[E, k/g, n]`.
+            for (t, regions, (n, k)) in [
+                (gate, layout.gate, (inter, hidden)),
+                (up, layout.up, (inter, hidden)),
+                (down, layout.down, (hidden, inter)),
+            ] {
+                let order = Some((experts, n, k / group));
+                stage_affine(weights, &mut packed, regions, t, order, missing)?;
+            }
+            Ok(packed)
+        }
+    }
+}
+
+/// Stage one affine projection's three tensors into `packed` at `regions`: the packed codes byte
+/// for byte, then the scales and the biases, each copied as on disk (`order` `None`, row-major)
+/// or transposed per block, `[blocks, n, groups]` to `[blocks, groups, n]` (`order` `Some((blocks,
+/// n, groups))`, group-major). A pure permutation of bf16 values: no byte is converted.
+/// `check_tensors` has passed, so each tensor is of its shape and dtype.
+fn stage_affine<A: DeviceAllocator>(
+    weights: &mut GpuWeights<A>,
+    packed: &mut [u8],
+    regions: AffineLayout,
+    t: AffineTensors,
+    order: Option<(u32, u32, u32)>,
+    missing: impl Fn(&'static str) -> LoadError,
+) -> Result<(), LoadError> {
+    let (codes, ..) = (weights.take_to_cpu_bytes(t.weight)).map_err(|_| missing(t.weight))?;
+    packed[regions.weight as usize..][..codes.len()].copy_from_slice(&codes);
+    for (tensor, at) in [(t.scales, regions.scales), (t.biases, regions.biases)] {
+        let (bytes, ..) = (weights.take_to_cpu_bytes(tensor)).map_err(|_| missing(tensor))?;
+        let out = &mut packed[at as usize..][..bytes.len()];
+        match order {
+            None => out.copy_from_slice(&bytes),
+            Some((blocks, n, groups)) => group_major(&bytes, out, (blocks, n, groups)),
+        }
+    }
+    Ok(())
+}
+
+/// `src` as `[blocks, n, groups]` bf16 written into `dst` as `[blocks, groups, n]`: element
+/// `(b, r, g)` moves to `(b, g, r)`, its two bytes unchanged.
+pub fn group_major(src: &[u8], dst: &mut [u8], (blocks, n, groups): (u32, u32, u32)) {
+    let (n, groups) = (n as usize, groups as usize);
+    let block = n * groups * 2;
+    for b in 0..blocks as usize {
+        let (s, d) = (&src[b * block..][..block], &mut dst[b * block..][..block]);
+        for r in 0..n {
+            for g in 0..groups {
+                let from = (r * groups + g) * 2;
+                let to = (g * n + r) * 2;
+                d[to..to + 2].copy_from_slice(&s[from..from + 2]);
+            }
         }
     }
 }

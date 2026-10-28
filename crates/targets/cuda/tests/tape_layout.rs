@@ -3182,3 +3182,469 @@ fn a_dense_biased_glm_bundle_is_refused_in_the_weight_table() {
     assert!(e.to_string().contains("GLM correction bias"), "{e}");
     assert!(matches!(e, ModelRefusal::NoBiasedBundle { ix: 1 }), "{e:?}");
 }
+
+// ── GLM-4.5-Air's MLX affine 4-bit g64 steps (#948) ────────────────
+
+use common::glm_moe::{
+    AFFINE_CHAIN_NS, GLM_AFFINE_FACTS, GROUP, glm_affine_chain, glm_affine_embed_facts,
+    glm_moe_affine,
+};
+use scratchy_target_cuda::step::{
+    AffineGemmBf16, ExpertProjection, affine_weight, moe_bundle_affine,
+};
+use scratchy_target_cuda::tape::TapeError;
+use scratchy_target_cuda_compiler::canonical::{
+    CudaAffine, CudaCanonical, GemmWeightRule, MoeShapeRule as Moe,
+};
+
+/// The affine GEMMs of `c`, in order.
+fn affine_gemms(c: &CudaCanonical) -> Vec<CudaStep> {
+    (c.steps.iter().copied())
+        .filter(|s| {
+            matches!(
+                s,
+                CudaStep::AffineGemm(_) | CudaStep::AffineGemmCol64(_) | CudaStep::AffineGemv(_)
+            )
+        })
+        .collect()
+}
+
+/// The `AffineGemmBf16` of an affine GEMM step.
+fn affine_of(s: CudaStep) -> AffineGemmBf16 {
+    let (CudaStep::AffineGemm(g) | CudaStep::AffineGemmCol64(g) | CudaStep::AffineGemv(g)) = s
+    else {
+        panic!("not an affine GEMM: {s:?}");
+    };
+    g
+}
+
+/// A GLM-shaped affine chain lowers under `CudaAffine::Lower` to the affine step whose bf16 twin
+/// the shape takes: the GEMV at one row, the tiled GEMM at n = 512 and the 64-column GEMM at 384
+/// and 256... above it (each `n` its twin's tile), each step's group the weight's, each weight's
+/// declared bytes the affine buffer's, and each tape validates. Each step names its twin, the
+/// bf16 step of its own operands.
+#[test]
+fn an_affine_chain_lowers_to_the_affine_twin_of_each_bf16_gemm() {
+    for m in [1, 128] {
+        let c = lower_with(&glm_affine_chain(m, 4, GROUP), GLM_AFFINE_FACTS)
+            .unwrap_or_else(|e| panic!("m={m}: {e}"));
+        let steps = affine_gemms(&c);
+        assert_eq!(steps.len(), c.steps.len(), "m={m}: every step affine");
+        let kinds: Vec<&str> = (steps.iter())
+            .map(|s| match s {
+                CudaStep::AffineGemm(_) => "AffineGemm",
+                CudaStep::AffineGemmCol64(_) => "AffineGemmCol64",
+                CudaStep::AffineGemv(_) => "AffineGemv",
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let want: &[&str] = if m == 1 {
+            &["AffineGemv", "AffineGemv", "AffineGemv"]
+        } else {
+            &["AffineGemm", "AffineGemmCol64", "AffineGemm"]
+        };
+        assert_eq!(kinds, want, "m={m}: the twins' kernels");
+        for (i, &s) in steps.iter().enumerate() {
+            let g = affine_of(s);
+            assert_eq!(g.group, GROUP, "m={m}: step {i}");
+            assert_eq!(g.n, AFFINE_CHAIN_NS[i], "m={m}: step {i}");
+            let twin = g.twin();
+            assert_eq!(
+                (twin.a, twin.b, twin.c, twin.m, twin.n, twin.k),
+                (g.a, g.b, g.c, g.m, g.n, g.k),
+                "m={m}: step {i}'s twin"
+            );
+            let want = affine_weight(g.n, g.k, g.group).expect("fits").bytes;
+            assert_eq!(
+                c.weight_bytes[g.b.0 as usize], want,
+                "m={m}: step {i}'s weight"
+            );
+        }
+        static_tape(&c)
+            .validate()
+            .unwrap_or_else(|e| panic!("m={m}: {e}"));
+    }
+}
+
+/// The same affine chain under `CudaAffine::Refuse` (every Qwen and Gemma model's facts) is today's
+/// refusal, byte for byte: `CanonicalRefusal::GemmWeight`, the bf16 kernel's Dense-only text.
+#[test]
+fn an_affine_chain_is_refused_as_today_when_the_arch_does_not_lower_affine() {
+    let e = refused_with(
+        &glm_affine_chain(128, 4, GROUP),
+        GLM_MOE_FACTS,
+        &["step 0 is a GEMM over a Affine weight; the bf16 kernel takes Dense only"],
+    );
+    assert!(
+        matches!(e, CanonicalRefusal::GemmWeight { step: 0, .. }),
+        "{e:?}"
+    );
+}
+
+/// A 3-bit weight is refused by name (GLM-4.5-Air's 3-bit base): `AffineForm { bits: 3 }`.
+#[test]
+fn a_3_bit_affine_weight_is_refused_by_name() {
+    let e = refused_with(
+        &glm_affine_chain(128, 3, GROUP),
+        GLM_AFFINE_FACTS,
+        &["3-bit at group 64", "[(4, 64)]"],
+    );
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::AffineGemm {
+                step: 0,
+                rule: GemmWeightRule::AffineForm { bits: 3, group: 64 },
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// A group-128 weight is refused by name: `AffineForm { group: 128 }`.
+#[test]
+fn a_group_128_affine_weight_is_refused_by_name() {
+    let e = refused_with(
+        &glm_affine_chain(128, 4, 128),
+        GLM_AFFINE_FACTS,
+        &["4-bit at group 128"],
+    );
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::AffineGemm {
+                rule: GemmWeightRule::AffineForm {
+                    bits: 4,
+                    group: 128
+                },
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// An affine `n` only the narrow bf16 GEMM takes (n = 32) is refused by name: CUDA has no narrow
+/// affine GEMM.
+#[test]
+fn an_affine_narrow_n_is_refused_by_name() {
+    let mut l = glm_affine_chain(128, 4, GROUP);
+    l.input.ops[0].op = SubOp::MatmulTile {
+        n: 32,
+        weight: GemmWeight::Affine {
+            affine: AffineInt4::mint(4, GROUP, 256).expect("4-bit, group 64"),
+        },
+    };
+    l.input.sources[1].cols = 32;
+    l.input.ops.truncate(1);
+    l.input.result = 0;
+    l.op_expansion.truncate(1);
+    let e = refused_with(&l, GLM_AFFINE_FACTS, &["narrow", "no narrow affine GEMM"]);
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::AffineGemm {
+                step: 0,
+                n: 32,
+                rule: GemmWeightRule::AffineNarrow,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// A GLM-shaped affine chain with a token-id head: its first step is the affine embed of the
+/// table's group, the table declared as its affine buffer (row-major scales, the same bytes),
+/// and the tape validates; the bf16 embed is not lowered.
+#[test]
+fn an_affine_embedding_table_lowers_to_the_affine_embed() {
+    for m in [1, 128] {
+        let c = lower_with(&glm_affine_chain(m, 4, GROUP), glm_affine_embed_facts(1024))
+            .unwrap_or_else(|e| panic!("m={m}: {e}"));
+        let Some(CudaStep::AffineEmbed(e)) = c.steps.first().copied() else {
+            panic!("m={m}: the head is {:?}", c.steps.first());
+        };
+        let hidden = common::glm_moe::H;
+        assert_eq!(
+            (e.rows, e.hidden, e.vocab, e.group),
+            (m, hidden, 1024, GROUP)
+        );
+        let want = affine_weight(1024, hidden, GROUP).expect("fits").bytes;
+        assert_eq!(c.weight_bytes[e.table.0 as usize], want, "m={m}: the table");
+        assert!(!c.steps.iter().any(|s| matches!(s, CudaStep::Embed(_))));
+        static_tape(&c)
+            .validate()
+            .unwrap_or_else(|e| panic!("m={m}: {e}"));
+    }
+}
+
+/// GLM's MoE block with 4-bit g64 experts lowers: the router dense (`MoeWeight::AffineBank`, at
+/// byte 0 of the bank), the routing's correction bias at `moe_bundle_affine`'s slab, the gate,
+/// up and down the affine expert steps of each projection (the GEMV at one row, the grouped GEMM
+/// at 512, `n_tile` 64 for the gate and up's 128 and 256 for the down's 256), the bundle declared
+/// as the affine bundle; every tape validates.
+#[test]
+fn a_glm_affine_moe_block_lowers_to_the_affine_expert_steps() {
+    use common::glm_moe::{EXPERTS, H as MH, I as MI};
+    let layout = moe_bundle_affine(EXPERTS, MH, MI, GROUP).expect("fits");
+    for m in [1, 512] {
+        let c = lower_with(&glm_moe_affine(m, 4, GROUP), GLM_AFFINE_FACTS)
+            .unwrap_or_else(|e| panic!("m={m}: {e}"));
+        let mut experts = Vec::new();
+        for s in &c.steps {
+            if let CudaStep::RouterLogits(r) = s {
+                assert_eq!(r.weight, MoeWeight::AffineBank, "m={m}: the router");
+            }
+            if let CudaStep::MoeRoute(r) = s {
+                let RouteProgram::GlmSigmoidBias { bias_offset, .. } = r.program else {
+                    panic!("m={m}: {:?}", r.program);
+                };
+                assert_eq!(bias_offset, layout.correction_bias, "m={m}: the bias");
+            }
+            if let CudaStep::ExpertGemmAffine(g) = s {
+                assert_eq!((g.weight, g.group), (MoeWeight::AffineBank, GROUP));
+                experts.push((g.proj, Some(g.n_tile)));
+            }
+            if let CudaStep::ExpertGemvAffine(g) = s {
+                assert_eq!((g.weight, g.group), (MoeWeight::AffineBank, GROUP));
+                experts.push((g.proj, None));
+            }
+            assert!(
+                !matches!(s, CudaStep::ExpertGemm(_) | CudaStep::ExpertGemv(_)),
+                "m={m}: a dense expert step {s:?}"
+            );
+        }
+        let tile = |t| if m == 1 { None } else { Some(t) };
+        assert_eq!(
+            experts,
+            [
+                (ExpertProjection::Gate, tile(64)),
+                (ExpertProjection::Up, tile(64)),
+                (ExpertProjection::Down, tile(256)),
+            ],
+            "m={m}: the affine expert steps"
+        );
+        assert_eq!(c.weight_bytes[1], layout.bytes, "m={m}: the bundle");
+        static_tape(&c)
+            .validate()
+            .unwrap_or_else(|e| panic!("m={m}: {e}"));
+    }
+}
+
+/// The same block under `CudaAffine::Refuse` is today's expert refusal, `MoeShapeRule::Affine`.
+#[test]
+fn a_glm_affine_moe_block_is_refused_as_today_when_the_arch_does_not_lower_affine() {
+    let e = refused_with(
+        &glm_moe_affine(512, 4, GROUP),
+        GLM_MOE_FACTS,
+        &["its experts are affine; CUDA's take dense bf16 only"],
+    );
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::MoeShape {
+                rule: Moe::Affine,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// A 3-bit expert bank is refused by name, the GEMM rule's expert twin.
+#[test]
+fn a_3_bit_affine_expert_bank_is_refused_by_name() {
+    let e = refused_with(
+        &glm_moe_affine(512, 3, GROUP),
+        GLM_AFFINE_FACTS,
+        &["3-bit affine at group 64"],
+    );
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::MoeShape {
+                rule: Moe::AffineForm { bits: 3, group: 64 },
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// A bundle whose checkpoint ships the router quantized (`TargetMoeAffine::router` `Some`) is
+/// refused by name at its router: CUDA has no affine router kernel.
+#[test]
+fn an_affine_router_is_refused_by_name() {
+    let facts = CudaModelFacts {
+        affine: CudaAffine::Lower {
+            embed: Some((4, GROUP)),
+            router: Some(8),
+        },
+        ..GLM_AFFINE_FACTS
+    };
+    let e = refused_with(
+        &glm_moe_affine(512, 4, GROUP),
+        facts,
+        &["router 8-bit affine"],
+    );
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::MoeShape {
+                step: 0,
+                rule: Moe::AffineRouter { bits: 8 },
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// `l` lowered under `facts`, as its static tape.
+fn affine_tape(l: &LoweredDecode, facts: CudaModelFacts) -> CudaTape {
+    static_tape(&lower_with(l, facts).unwrap_or_else(|e| panic!("lowers: {e}")))
+}
+
+/// `tape` with its steps rewritten by `f`.
+fn with_steps(tape: CudaTape, f: impl Fn(&mut CudaStep)) -> CudaTape {
+    let mut steps = tape.steps.to_vec();
+    steps.iter_mut().for_each(f);
+    CudaTape {
+        steps: Box::leak(steps.into_boxed_slice()),
+        ..tape
+    }
+}
+
+/// `validate` refuses an affine step whose `k` is not a whole number of groups, or whose group no
+/// form names: `TapeError::AffineGroup`.
+#[test]
+fn validate_refuses_an_affine_step_off_its_group() {
+    let tape = affine_tape(&glm_affine_chain(128, 4, GROUP), GLM_AFFINE_FACTS);
+    let bad = with_steps(tape, |s| {
+        if let CudaStep::AffineGemm(g) | CudaStep::AffineGemmCol64(g) = s {
+            g.group = 48;
+        }
+    });
+    let e = bad.validate().expect_err("a group of 48 is no form");
+    eprintln!("refused: {e}");
+    assert!(
+        matches!(
+            e,
+            TapeError::AffineGroup {
+                step: 0,
+                group: 48,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// `validate` refuses an affine step whose weight the tape declares as anything but the affine
+/// buffer of its `(n, k, group)` (here the bf16 `[n, k]`'s bytes): `TapeError::AffineWeight`.
+#[test]
+fn validate_refuses_an_affine_step_over_a_non_affine_weight() {
+    let tape = affine_tape(&glm_affine_chain(128, 4, GROUP), GLM_AFFINE_FACTS);
+    let mut weights = tape.weight_bytes.to_vec();
+    let dense = u64::from(common::glm_moe::H) * u64::from(AFFINE_CHAIN_NS[0]) * 2;
+    weights[1] = dense;
+    let bad = CudaTape {
+        weight_bytes: Box::leak(weights.into_boxed_slice()),
+        ..tape
+    };
+    let e = bad
+        .validate()
+        .expect_err("a dense weight under an affine step");
+    eprintln!("refused: {e}");
+    assert!(
+        matches!(
+            e,
+            TapeError::AffineWeight {
+                step: 0,
+                ix: 1,
+                declared,
+                ..
+            } if declared == dense
+        ),
+        "{e:?}"
+    );
+}
+
+/// `validate` refuses GLM's routing whose correction bias is not at the affine bundle's slab
+/// (here the dense bundle's offset): `TapeError::RouteBiasOffset`, naming the affine offset.
+#[test]
+fn validate_refuses_an_affine_bundles_bias_offset_outside_its_slab() {
+    use common::glm_moe::{EXPERTS, H as MH, I as MI};
+    let tape = affine_tape(&glm_moe_affine(512, 4, GROUP), GLM_AFFINE_FACTS);
+    let dense = moe_bundle_biased(EXPERTS, MH, MI).expect("fits").bias;
+    let want = moe_bundle_affine(EXPERTS, MH, MI, GROUP)
+        .expect("fits")
+        .correction_bias;
+    let bad = with_steps(tape, |s| {
+        if let CudaStep::MoeRoute(r) = s
+            && let RouteProgram::GlmSigmoidBias { bias_offset, .. } = &mut r.program
+        {
+            *bias_offset = dense;
+        }
+    });
+    let e = bad
+        .validate()
+        .expect_err("the dense offset in an affine bundle");
+    eprintln!("refused: {e}");
+    assert!(
+        matches!(e, TapeError::RouteBiasOffset { offset, want: Some(w), .. } if offset == dense && w == want),
+        "{e:?}"
+    );
+}
+
+/// `validate` refuses an affine expert step reading a non-affine bundle (its `weight` the dense
+/// `Bundle`), and a dense expert step reading an affine bank: `TapeError::ExpertWeight`.
+#[test]
+fn validate_refuses_an_affine_expert_step_over_a_non_affine_bundle() {
+    for m in [1, 512] {
+        let tape = affine_tape(&glm_moe_affine(m, 4, GROUP), GLM_AFFINE_FACTS);
+        let bad = with_steps(tape, |s| {
+            if let CudaStep::ExpertGemmAffine(g) = s {
+                g.weight = MoeWeight::Bundle;
+            }
+            if let CudaStep::ExpertGemvAffine(g) = s {
+                g.weight = MoeWeight::Bundle;
+            }
+        });
+        let e = bad
+            .validate()
+            .expect_err("an affine step over a dense bundle");
+        eprintln!("m={m} refused: {e}");
+        assert!(
+            matches!(
+                e,
+                TapeError::ExpertWeight {
+                    weight: MoeWeight::Bundle,
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+    }
+    let tape = affine_tape(&glm_moe(512), GLM_MOE_FACTS);
+    let bad = with_steps(tape, |s| {
+        if let CudaStep::ExpertGemm(g) = s {
+            g.weight = MoeWeight::AffineBank;
+        }
+    });
+    let e = bad
+        .validate()
+        .expect_err("a dense step over an affine bank");
+    assert!(
+        matches!(
+            e,
+            TapeError::ExpertWeight {
+                weight: MoeWeight::AffineBank,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}

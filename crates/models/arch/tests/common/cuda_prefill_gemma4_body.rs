@@ -116,6 +116,7 @@ fn roles() -> Vec<Option<Role>> {
                 }) => match weight {
                     MoeWeight::Own => set(bundle.0, Role::Matrix { k: hidden }),
                     MoeWeight::Bundle => panic!("weight {}: a Qwen MoE bundle", bundle.0),
+                    MoeWeight::AffineBank => panic!("weight {}: an affine bank", bundle.0),
                 },
                 CudaStep::ExpertGemm(ExpertGemmBf16 {
                     bundle,
@@ -142,9 +143,16 @@ fn roles() -> Vec<Option<Role>> {
                         },
                     ),
                     MoeWeight::Bundle => panic!("weight {}: a Qwen MoE bundle", bundle.0),
+                    MoeWeight::AffineBank => panic!("weight {}: an affine bank", bundle.0),
                 },
                 CudaStep::GatedDeltaNet(_) => panic!("a GDN layer in a Gemma tape"),
                 CudaStep::BiasAdd(_) => panic!("a bias add in a Gemma tape"),
+                CudaStep::AffineGemm(_)
+                | CudaStep::AffineGemmCol64(_)
+                | CudaStep::AffineGemv(_)
+                | CudaStep::AffineEmbed(_)
+                | CudaStep::ExpertGemmAffine(_)
+                | CudaStep::ExpertGemvAffine(_) => panic!("an affine step in a Gemma tape"),
                 // The steps that read no weight.
                 CudaStep::Add(_)
                 | CudaStep::SiluMul(_)
@@ -1711,6 +1719,12 @@ fn kinds(s: &CudaStep) -> (&'static str, &'static str) {
         CudaStep::SoftCap(_) => ("SoftCap", "SoftCap"),
         CudaStep::RouterNorm(_) => ("RouterNorm", "RouterNorm"),
         CudaStep::BiasAdd(_) => ("BiasAdd", "BiasAdd"),
+        CudaStep::AffineGemm(_) => ("AffineGemm", "AffineGemv"),
+        CudaStep::AffineGemmCol64(_) => ("AffineGemmCol64", "AffineGemv"),
+        CudaStep::AffineGemv(_) => ("AffineGemv", "AffineGemv"),
+        CudaStep::AffineEmbed(_) => ("AffineEmbed", "AffineEmbed"),
+        CudaStep::ExpertGemmAffine(_) => ("ExpertGemmAffine", "ExpertGemvAffine"),
+        CudaStep::ExpertGemvAffine(_) => ("ExpertGemvAffine", "ExpertGemvAffine"),
     }
 }
 
