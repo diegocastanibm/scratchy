@@ -16,6 +16,9 @@ use scratchy_tensors::{DType, DeviceAllocator, GpuTensor};
 use crate::weights::GpuWeights;
 use scratchy_quantizations::ggml_quant::GgmlStorage;
 use scratchy_quantizations::layers_quant::{AffineQuantLinear, Nvfp4Linear};
+// The affine embedding's payload type lives in `scratchy-quantizations`; re-export it under
+// `crate::__gpu::layers::…` so a CUDA emission of an affine-embed model's field paths resolve.
+pub use scratchy_quantizations::AffineQuantEmbedding;
 
 // ---------------------------------------------------------------------------
 // Linear
