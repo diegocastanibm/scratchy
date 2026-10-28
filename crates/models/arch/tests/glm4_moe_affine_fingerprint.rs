@@ -125,6 +125,20 @@ fn each_glm_variant_claims_only_its_own_checkpoint() {
         b3.is_some() || b4.is_some(),
         "a glm-4.5-air build compiled neither GLM variant"
     );
+    // With both presets in scope, both variants must be here, so the cross-checks below cannot
+    // pass by checking one side only.
+    let presets = scratchy_quantizations::enabled_presets();
+    if ["mlx-affine-b3-g64-qembed", "mlx-affine-b4-g64-qembed"]
+        .iter()
+        .all(|p| presets.contains(p))
+    {
+        assert!(
+            b3.is_some() && b4.is_some(),
+            "both GLM presets are on but the emission lacks a variant: 3-bit {}, 4-bit {}",
+            b3.is_some(),
+            b4.is_some()
+        );
+    }
     if let Some(b4) = b4 {
         let rows = affine_rows(b4);
         assert!(

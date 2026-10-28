@@ -3138,11 +3138,12 @@ mod tests {
     /// The router `modules_to_not_convert` names is dense at every layer, through the full
     /// safetensors path the MoE codegen asks by (`model.layers.N.mlp.gate`) and the DSL role
     /// alike; every other role (layer 0's dense MLP, the shared expert, attention) is 4-bit; the
-    /// routed experts are 4/4/4. The match is exact: `mlp.gate_proj` is not `mlp.gate`.
+    /// routed experts are 4/4/4; `embed_tokens` and `lm_head` are affine 4-bit g64. The match
+    /// is exact: `mlp.gate_proj` is not `mlp.gate`.
     #[test]
     fn glm_b4s_router_is_dense_and_every_other_role_4_bit() {
         use scratchy_subtile::subtile_ir::{ExpertBody, GatedAct};
-        let (method, program) = (method_of(GLM_B4), glm_program());
+        let (method, mut program) = (method_of(GLM_B4), glm_program());
         for layer in [1, 45] {
             let at =
                 |role: &str| affine_role_bits(&program, &method, role, Some(UnrollIndex(layer)));
@@ -3180,6 +3181,39 @@ mod tests {
                     down: 4
                 }),
                 "layer {layer}"
+            );
+        }
+        // The embedding table and the untied head are affine 4-bit g64, resolved from GLM's own
+        // config merged with the preset and its drift file, as the build resolves them.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let model = crate::config::load_file_with_preset(
+            &base.join("../../models/arch/configs/glm4-moe/glm-4.5-air.json"),
+            &base.join("../../models/quantization/presets/mlx-affine-b4-g64-qembed.json"),
+        )
+        .expect("the GLM b4 variant loads");
+        let embed = program.weights.intern_str(vec!["embed_tokens".to_string()]);
+        let head = program.weights.intern_str(vec!["lm_head".to_string()]);
+        let node = |id: u32, op: OpKind, weight: WeightId| crate::fuf::FufNode {
+            id: crate::fuf::TileId(id),
+            op,
+            inputs: vec![FufInput::Weight {
+                id: weight,
+                index: None,
+                storage: StorageFormat::Dense,
+            }],
+            outputs: Vec::new(),
+        };
+        let fuf = Fuf {
+            nodes: vec![node(0, OpKind::Embed, embed), node(1, OpKind::Gemm, head)],
+        };
+        for (name, id) in [("embed_tokens", embed), ("lm_head", head)] {
+            assert_eq!(
+                storage_format_for_weight(&program, &fuf, id, None, &model),
+                StorageFormat::Affine {
+                    bits: 4,
+                    group_size: 64
+                },
+                "{name}"
             );
         }
         // Without the list the router resolves at the section default, as before.
