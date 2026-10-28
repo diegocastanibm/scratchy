@@ -1141,6 +1141,39 @@ fn an_embed_above_int_max_rows_is_refused() {
     ));
 }
 
+/// An affine embedding table of a form CUDA has no affine embed for (3-bit, the handoff's
+/// `embed_affine` of GLM's 3-bit base) is refused by name as `EmbedShapeRule::AffineForm`.
+#[test]
+fn an_affine_embedding_table_of_another_form_is_refused_by_name() {
+    let facts = CudaModelFacts {
+        embed: Some(CudaEmbedFacts { vocab: 256 }),
+        affine: CudaAffine::Lower {
+            embed: Some((3, 64)),
+            router: None,
+        },
+        ..FACTS
+    };
+    let e = match lower_canonical(&tied_head(128), facts, AT_128) {
+        Err(e) => e,
+        Ok(c) => panic!("lowered an embed the kernel cannot run: {c:?}"),
+    };
+    assert!(
+        e.to_string()
+            .contains("the table is 3-bit affine at group 64; CUDA's affine embed takes [(4, 64)]"),
+        "{e}"
+    );
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::EmbedShape {
+                rule: EmbedShapeRule::AffineForm { bits: 3, group: 64 },
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
 /// The tied lm_head names the table's tensor: it reads the table's buffer, and its own index is
 /// emptied. Both buckets are rewritten, and each tape still validates.
 #[test]

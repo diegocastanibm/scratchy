@@ -3648,3 +3648,167 @@ fn validate_refuses_an_affine_expert_step_over_a_non_affine_bundle() {
         "{e:?}"
     );
 }
+
+/// GLM's affine MoE block at 512 rows through `lower_model` as the 4-bit model hands it over: its
+/// bundle a model weight with a prefix, the handoff's `moe_affine` naming it affine, and its
+/// `affine_bundle_names` empty. The weight table refuses it as `ModelRefusal::NoAffineName`,
+/// naming the bundle's index and its first unnamed tensor, the router.
+#[test]
+fn an_affine_bundle_the_handoff_names_no_tensor_of_is_refused() {
+    use scratchy_subtile::handoff::{
+        AffineBundleTensor, TargetBucket, TargetModelFacts, TargetModelInput, TargetMoeAffine,
+        TargetPoint,
+    };
+    use scratchy_target_cuda_compiler::emit::{ModelRefusal, lower_model};
+    let input = TargetModelInput {
+        stem: "glm_moe_affine".to_string(),
+        arch: "glm4-moe".to_string(),
+        buckets: vec![TargetBucket {
+            point: TargetPoint { m: 512, sk: 1 },
+            lowered: glm_moe_affine(512, 4, GROUP),
+        }],
+        unlowered: Vec::new(),
+        facts: TargetModelFacts {
+            head_dim: 0,
+            rot_dim: 0,
+            rope_theta: None,
+            rms_norm_eps: 1e-5,
+            vocab_size: 256,
+            gdn: None,
+            dsl_shared_expert_bases: vec!["mlp".to_string()],
+            attn_classes: Vec::new(),
+            embed_affine: None,
+        },
+        weight_prefixes: vec![(1, None, "model.layers.1.mlp".to_string())],
+        embed_prefix: Some("model.embed_tokens".to_string()),
+        bundle_tensor_names: Vec::new(),
+        moe_affine: vec![(
+            1,
+            None,
+            TargetMoeAffine {
+                group_size: GROUP,
+                router: None,
+                experts: [Some(4), Some(4), Some(4)],
+            },
+        )],
+        affine_bundle_names: Vec::new(),
+    };
+    let e = lower_model(&input).expect_err("an affine bundle with no tensor names");
+    eprintln!("refused: {e}");
+    assert!(
+        e.to_string()
+            .contains("the handoff names no Router tensor of it"),
+        "{e}"
+    );
+    assert!(
+        matches!(
+            e,
+            ModelRefusal::NoAffineName {
+                ix: 1,
+                tensor: AffineBundleTensor::Router
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// GLM-4.5-Air's parity-tiny config (`glm-4.5-air-parity-tiny`, 3-bit at group 64, hidden 128) at
+/// its first GEMM, `m = 1 n = 128 k = 128`, as the build refuses it by name: the affine chain at
+/// that shape is `CanonicalRefusal::AffineGemm { AffineForm { bits: 3, group: 64 } }`, the text
+/// the expansion of `model/glm-4.5-air-parity-tiny` panics with.
+#[test]
+fn glm_parity_tiny_is_refused_by_name() {
+    let mut l = glm_affine_chain(1, 3, GROUP);
+    l.input.sources[0].cols = 128;
+    l.input.sources[1].rows = 128;
+    l.input.sources[1].cols = 128;
+    l.input.ops[0].op = SubOp::MatmulTile {
+        n: 128,
+        weight: GemmWeight::Affine {
+            affine: AffineInt4::mint(3, GROUP, 128).expect("3-bit, group 64, over k = 128"),
+        },
+    };
+    l.input.ops.truncate(1);
+    l.input.result = 0;
+    l.op_expansion.truncate(1);
+    let e = refused_with(
+        &l,
+        GLM_AFFINE_FACTS,
+        &[
+            "step 0 is a GEMM of m=1 n=128 k=128 over an affine weight",
+            "it is 3-bit at group 64; CUDA's affine steps take [(4, 64)] (bits, group)",
+        ],
+    );
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::AffineGemm {
+                step: 0,
+                m: 1,
+                n: 128,
+                k: 128,
+                rule: GemmWeightRule::AffineForm { bits: 3, group: 64 },
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// Under `CudaAffine::Refuse` (every Qwen and Gemma model's facts), the router of an affine
+/// bundle keeps the dense bundle's layout, `MoeWeight::Bundle`, as before #948: the bundle is
+/// refused at its first expert step, and the router step itself is unchanged. `lower_step` is
+/// called on the router alone (step 0), as the refusal of the expert steps after it would hide
+/// it from `lower_canonical`. Under `Lower` the same router reads the affine bank.
+#[test]
+fn a_refused_archs_router_keeps_the_dense_bundle_layout() {
+    let l = glm_moe_affine(512, 4, GROUP);
+    let at = CanonicalAt {
+        stem: "glm_moe_affine",
+        m: 512,
+    };
+    for (facts, want) in [
+        (GLM_MOE_FACTS, MoeWeight::Bundle),
+        (GLM_AFFINE_FACTS, MoeWeight::AffineBank),
+    ] {
+        let p = plan_canonical(&l, facts, at).expect("the block plans");
+        let lowered = lower_with(&glm_moe(512), GLM_MOE_FACTS).expect("the dense block lowers");
+        let computes: Vec<TapeStep<'_>> = (p.tape.instrs().iter())
+            .filter_map(|i| match i {
+                Instr::Compute {
+                    node,
+                    writes,
+                    inputs,
+                    ..
+                } => Some((&p.graph.nodes[node.index()], *writes, inputs)),
+                _ => None,
+            })
+            .enumerate()
+            .map(|(step, (node, writes, inputs))| TapeStep {
+                step,
+                node,
+                writes,
+                inputs,
+            })
+            .collect();
+        let cx = StepCx {
+            graph: &p.graph,
+            bindings: &p.lowered.bindings,
+            colouring: &p.colouring,
+            facts: p.facts,
+            tokens: Some(512),
+            offsets: Ok(&lowered.colour_offsets),
+            rotary: None,
+            rotary_local: None,
+            kv: Ok(None),
+            kv_regions: None,
+            gdn_layers: &[],
+            gdn_regions: None,
+            moe: lowered.moe,
+        };
+        let router = lower_step(&cx, &computes[0], &computes);
+        let Ok(Some(CudaStep::RouterLogits(r))) = router else {
+            panic!("{:?}: {router:?}", facts.affine);
+        };
+        assert_eq!(r.weight, want, "{:?}: the router's layout", facts.affine);
+    }
+}
