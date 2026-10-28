@@ -1463,7 +1463,9 @@ fn router_logits(
             CudaAffine::Lower {
                 router: Some(bits), ..
             } => return Err(moe_refusal(s, MoeShapeRule::AffineRouter { bits })),
-            CudaAffine::Lower { router: None, .. } | CudaAffine::Refuse => MoeWeight::AffineBank,
+            CudaAffine::Lower { router: None, .. } => MoeWeight::AffineBank,
+            // Refused at the bundle's first expert step (`MoeShapeRule::Affine`), as today.
+            CudaAffine::Refuse => MoeWeight::Bundle,
         },
         (weight, _) => weight,
     };
