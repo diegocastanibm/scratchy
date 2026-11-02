@@ -315,6 +315,95 @@ struct tile_pad {
     }
 };
 
+// One MLX affine 4-bit weight: `scale · q + bias`, `q` the 4-bit code (0..15), `scale` and `bias`
+// its group's bf16 values widened to f32: the f32 `scratchy_quantizations::affine::
+// affine_dequant_b4_to_dtype` forms before its one bf16 rounding, which is `scale * q` and then
+// `+ bias`, two f32 operations. Here, the same two:
+//   - the product, `fma(scale, q, −0)`: exact, since a bf16 has 8 significant bits and `q < 16`
+//     has 4, so its rounding is the host's (none, or to ±inf when it overflows); the `−0` addend
+//     keeps the product's sign of zero (`+0 + −0 = +0`, `−0 + −0 = −0`);
+//   - the sum, `fma(p, 1, bias)`: `p + bias` rounded once, the host's add.
+// A single `fma(scale, q, bias)` would round once too, but differs from the host where `scale · q`
+// overflows f32 and `bias` brings it back. `__fmaf_ieee_rn` ignores `-ftz=true` (part of
+// `--use_fast_math`, build.rs), so a subnormal scale, bias, product or result is kept, as the host
+// keeps it; a plain `fmaf`, `__fmul_rn` or `__fadd_rn` would flush it to zero.
+struct affine_b4 {
+    static constexpr int GROUP = 64;
+    template <typename T>
+    static __device__ inline T op(const int& code, const T& scale, const T& bias);
+};
+template <>
+__device__ inline float affine_b4::op<float>(const int& code, const float& scale,
+                                             const float& bias) {
+    const float product = __fmaf_ieee_rn(scale, float(code), -0.0f);
+    return __fmaf_ieee_rn(product, 1.0f, bias);
+}
+
+// TK-GAP(affine_b4_dequant) begin
+// TK has no packed 4-bit type on Hopper and no dequant op (`fp4e2m1` is a float format, SM100
+// only), so these two helpers fill the gap, written against TK types. The codes are `uint8`
+// elements of an `st` or `sv`, two a byte, element `2j` the low nibble of byte `j` (MLX's order),
+// selected by integer shifts and masks. `scale` and `bias` widen, and the result rounds to bf16
+// (round to nearest even), through TK's `base_types::convertor` (`common/base_types.cuh:556, :561`).
+// Every element is read and written through TK's accessors: `st::operator[]`, which applies the
+// swizzle (`types/shared/st.cuh:140`), and `sv::operator[]` (`types/shared/sv.cuh:73`).
+//
+// `affine_b4_dequant_row`: columns `col0 .. col0 + COLS` of row `row` of `dst` (an `st` of bf16,
+// `[R, 64]`), from bytes `col0/2 .. (col0 + COLS)/2` of row `row` of `codes` (an `st` of uint8,
+// `[R, 32]`: one 64-code group a row) and element `row` of `scales` and `biases` (`sv`s of bf16,
+// one value a row). The calling thread does all of it; the caller splits the rows and columns
+// between its threads and syncs them after.
+template <int COLS, kittens::ducks::st::all DST, kittens::ducks::st::all CODES,
+          kittens::ducks::sv::all SV>
+__device__ static inline void affine_b4_dequant_row(DST& dst, const CODES& codes,
+                                                    const SV& scales, const SV& biases,
+                                                    const int row, const int col0) {
+    static_assert(std::is_same_v<typename DST::dtype, kittens::bf16>, "a bf16 tile out");
+    static_assert(std::is_same_v<typename CODES::dtype, kittens::uint8>, "packed uint8 codes");
+    static_assert(std::is_same_v<typename SV::dtype, kittens::bf16>, "bf16 scales and biases");
+    static_assert(DST::cols == affine_b4::GROUP && CODES::cols == affine_b4::GROUP / 2,
+                  "one group a row");
+    static_assert(COLS % 2 == 0 && affine_b4::GROUP % COLS == 0, "whole bytes of one row");
+    using widen = kittens::base_types::convertor<float, kittens::bf16>;
+    using round = kittens::base_types::convertor<kittens::bf16, float>;
+    const float s = widen::convert(scales[row]);
+    const float b = widen::convert(biases[row]);
+#pragma unroll
+    for (int j = 0; j < COLS / 2; j++) {
+        const int c = col0 + 2 * j;
+        const int byte = codes[{row, c / 2}];
+        dst[{row, c}] = round::convert(affine_b4::op<float>(byte & 0x0F, s, b));
+        dst[{row, c + 1}] = round::convert(affine_b4::op<float>((byte >> 4) & 0x0F, s, b));
+    }
+}
+
+// `affine_b4_dequant_sv`: elements `0 .. len` of `dst` (an `sv` of bf16), from bytes `0 .. len/2`
+// of `codes` (an `sv` of uint8), element `i` with element `i / 64` of `scales` and `biases` (one
+// row's run of groups). One warp runs it: lane `l` takes bytes `l, l + 32, …`, so the warp's 32
+// stores of a step are 128 contiguous bytes. The caller syncs its warp before (the inputs' last
+// write) and after (the output's next read). `len` is a multiple of 64, at most `DST::length`.
+template <kittens::ducks::sv::all DST, kittens::ducks::sv::all CODES, kittens::ducks::sv::all SV>
+__device__ static inline void affine_b4_dequant_sv(DST& dst, const CODES& codes,
+                                                   const SV& scales, const SV& biases,
+                                                   const int len) {
+    static_assert(std::is_same_v<typename DST::dtype, kittens::bf16>, "a bf16 vector out");
+    static_assert(std::is_same_v<typename CODES::dtype, kittens::uint8>, "packed uint8 codes");
+    static_assert(std::is_same_v<typename SV::dtype, kittens::bf16>, "bf16 scales and biases");
+    static_assert(CODES::length * 2 == DST::length, "two codes a byte");
+    static_assert(SV::length * affine_b4::GROUP == DST::length, "one scale and bias a group");
+    using widen = kittens::base_types::convertor<float, kittens::bf16>;
+    using round = kittens::base_types::convertor<kittens::bf16, float>;
+    for (int j = kittens::laneid(); j < len / 2; j += kittens::WARP_THREADS) {
+        const int g = 2 * j / affine_b4::GROUP;
+        const float s = widen::convert(scales[g]);
+        const float b = widen::convert(biases[g]);
+        const int byte = codes[j];
+        dst[2 * j] = round::convert(affine_b4::op<float>(byte & 0x0F, s, b));
+        dst[2 * j + 1] = round::convert(affine_b4::op<float>((byte >> 4) & 0x0F, s, b));
+    }
+}
+// TK-GAP(affine_b4_dequant) end
+
 // TK-GAP(exclusive_scan_sv) begin
 // An exclusive prefix sum over a shared vector, in place, each element first mapped by `op`:
 // `v[i] = Σ_{j < i} op(v[j])`, returning the total `Σ_j op(v[j])`. TK has reductions to one value

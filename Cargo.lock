@@ -3777,6 +3777,7 @@ dependencies = [
  "inventory",
  "safetensors",
  "scratchy-layers",
+ "scratchy-quantizations",
  "scratchy-subtile",
  "scratchy-target-cuda-compiler",
  "scratchy-tensors",

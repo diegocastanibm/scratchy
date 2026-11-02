@@ -39,11 +39,12 @@ use crate::kernels::{self, KernelError};
 use crate::rotary::fill_rotary_rows_with_freq_dim;
 use crate::step::{
     ATTN_D128_BF16_HEAD_DIM, ATTN_D512_BF16_HEAD_DIM, ATTN_DECODE_BF16_HEAD_DIM,
-    ATTN_PREFILL_BF16_HEAD_DIM, AddBf16, AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16,
-    ExpertGemmBf16, ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16,
-    GateSplitBf16, GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel,
-    MoeRouteBf16, MoeWeight, PairRows, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16,
-    RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16,
+    ATTN_PREFILL_BF16_HEAD_DIM, AddBf16, AffineEmbedBf16, AttnPrefillBf16, CudaStep, EmbedBf16,
+    ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection, ExpertSortBf16,
+    GateApplyBf16, GateScaleBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16, LayerScaleBf16,
+    MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16, MoeWeight, PairRows, RmsNormBf16,
+    RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram, RouterLogitsBf16, ScaleBf16,
+    SiluMulBf16, SoftCapBf16, affine_weight,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape,
@@ -586,8 +587,8 @@ fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, 
 ///   program is instantiated at 256 only (its launcher refuses any other count);
 /// - GLM's bias add and its sigmoid-and-bias routing, and a KV append or an attention at head dim
 ///   [`ATTN_D128_BF16_HEAD_DIM`]: their kernels are #938's 14b, which removes these arms;
-/// - the six MLX-affine steps: the affine GEMM, GEMV and embed are #949's, the affine expert GEMM
-///   and GEMV #950's, which remove these arms.
+/// - the two MLX-affine expert steps, the affine expert GEMM and GEMV: their kernels are #950's,
+///   which removes these arms.
 ///
 /// `None` for every other step. Every variant is named, so a new step states its case here.
 fn not_launched(s: &CudaStep) -> Option<&'static str> {
@@ -602,10 +603,6 @@ fn not_launched(s: &CudaStep) -> Option<&'static str> {
             ..
         }) => Some("MoeRoute"),
         CudaStep::BiasAdd(_) => Some("BiasAdd"),
-        CudaStep::AffineGemm(_) => Some("AffineGemm"),
-        CudaStep::AffineGemmCol64(_) => Some("AffineGemmCol64"),
-        CudaStep::AffineGemv(_) => Some("AffineGemv"),
-        CudaStep::AffineEmbed(_) => Some("AffineEmbed"),
         CudaStep::ExpertGemmAffine(_) => Some("ExpertGemmAffine"),
         CudaStep::ExpertGemvAffine(_) => Some("ExpertGemvAffine"),
         CudaStep::RopeAppend(RopeAppendBf16 {
@@ -647,7 +644,11 @@ fn not_launched(s: &CudaStep) -> Option<&'static str> {
         | CudaStep::LayerScale(_)
         | CudaStep::SoftCap(_)
         | CudaStep::RouterNorm(_)
-        | CudaStep::GemmCol64(_) => None,
+        | CudaStep::GemmCol64(_)
+        | CudaStep::AffineGemm(_)
+        | CudaStep::AffineGemmCol64(_)
+        | CudaStep::AffineGemv(_)
+        | CudaStep::AffineEmbed(_) => None,
     }
 }
 
@@ -1387,16 +1388,76 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         op: "BiasAdd",
                     });
                 }
-                // No kernels yet (#949, #950): `not_launched` refused the tape before any copy, so
-                // these arms are never reached.
-                CudaStep::AffineGemm(_)
-                | CudaStep::AffineGemmCol64(_)
-                | CudaStep::AffineGemv(_)
-                | CudaStep::AffineEmbed(_)
-                | CudaStep::ExpertGemmAffine(_)
-                | CudaStep::ExpertGemvAffine(_) => {
-                    let op = not_launched(s).expect("not_launched names every affine step");
+                // No kernels yet (#950): `not_launched` refused the tape before any copy, so these
+                // arms are never reached.
+                CudaStep::ExpertGemmAffine(_) | CudaStep::ExpertGemvAffine(_) => {
+                    let op = not_launched(s).expect("not_launched names every affine expert step");
                     return Err(ForwardError::NotLaunched { step, op });
+                }
+                CudaStep::AffineGemm(g) => {
+                    let w = Self::affine_regions(weights, g.b, (g.n, g.k, g.group));
+                    // SAFETY: as above, for `a` (`m*k`), `c` (`m*n`) and the weight
+                    // (`affine_weight(n, k, group)`'s bytes, whose regions `w` points into).
+                    unsafe {
+                        kernels::affine_gemm_bf16_abt(
+                            slot(g.a),
+                            w,
+                            slot(g.c),
+                            (g.m, g.n, g.k, g.group),
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::AffineGemmCol64(g) => {
+                    let w = Self::affine_regions(weights, g.b, (g.n, g.k, g.group));
+                    // SAFETY: as `AffineGemm`'s.
+                    unsafe {
+                        kernels::affine_gemm_col64_bf16_abt(
+                            slot(g.a),
+                            w,
+                            slot(g.c),
+                            (g.m, g.n, g.k, g.group),
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::AffineGemv(g) => {
+                    let w = Self::affine_regions(weights, g.b, (g.n, g.k, g.group));
+                    // SAFETY: as `AffineGemm`'s, for `a` (`k`, its `m` is 1: `validate`) and `c`
+                    // (`n`).
+                    unsafe {
+                        kernels::affine_gemv_bf16_abt(
+                            slot(g.a),
+                            w,
+                            slot(g.c),
+                            (g.n, g.k, g.group),
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::AffineEmbed(AffineEmbedBf16 {
+                    tokens,
+                    table,
+                    out,
+                    rows,
+                    hidden,
+                    vocab,
+                    group,
+                }) => {
+                    let w = Self::affine_regions(weights, table, (vocab, hidden, group));
+                    // SAFETY: as above, for `tokens` (`rows` u32, the token ids uploaded above,
+                    // every one below `vocab`), `out` (`rows*hidden`) and the table
+                    // (`affine_weight(vocab, hidden, group)`'s bytes, whose regions `w` points
+                    // into).
+                    unsafe {
+                        kernels::affine_embed_bf16(
+                            slot(tokens),
+                            w,
+                            slot(out),
+                            (rows, hidden, vocab, group),
+                            stream.0,
+                        )
+                    }
                 }
                 CudaStep::GemmCol64(GemmBf16 { a, b, c, m, n, k }) => {
                     let b = weights[b.0 as usize].ptr();
@@ -2092,6 +2153,27 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 (s.m, s.experts, s.top_k, s.hidden, s.max_tiles),
                 stream.0,
             )
+        }
+    }
+
+    /// The three regions of the MLX affine weight `ix` of `weights`, laid out as
+    /// `step::affine_weight(n, k, group)` (`n` rows of `k` codes): the packed codes, the scales and
+    /// the biases. `validate` checked the step's form, so the layout exists, and `new` checked the
+    /// buffer holds its bytes; the addresses are computed, never dereferenced.
+    fn affine_regions(
+        weights: &[DeviceBuffer],
+        ix: WeightIx,
+        (n, k, group): (u32, u32, u32),
+    ) -> kernels::AffineRegions {
+        let layout = affine_weight(n, k, group).expect("`validate` checked the affine form");
+        let base = weights[ix.0 as usize].ptr().cast_const();
+        let at = |offset: u64| {
+            base.wrapping_byte_add(usize::try_from(offset).expect("a weight offset fits a usize"))
+        };
+        kernels::AffineRegions {
+            codes: at(layout.weight),
+            scales: at(layout.scales),
+            biases: at(layout.biases),
         }
     }
 

@@ -230,6 +230,56 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_gemv_bf16_abt_prepare() -> i32;
+    fn scratchy_cuda_affine_gemm_bf16_abt_prepare() -> i32;
+    fn scratchy_cuda_affine_gemm_bf16_abt(
+        a: *const c_void,
+        codes: *const c_void,
+        scales: *const c_void,
+        biases: *const c_void,
+        c: *mut c_void,
+        m: u32,
+        n: u32,
+        k: u32,
+        group: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_affine_gemm_col64_bf16_abt_prepare() -> i32;
+    fn scratchy_cuda_affine_gemm_col64_bf16_abt(
+        a: *const c_void,
+        codes: *const c_void,
+        scales: *const c_void,
+        biases: *const c_void,
+        c: *mut c_void,
+        m: u32,
+        n: u32,
+        k: u32,
+        group: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_affine_gemv_bf16_abt_prepare() -> i32;
+    fn scratchy_cuda_affine_gemv_bf16_abt(
+        a: *const c_void,
+        codes: *const c_void,
+        scales: *const c_void,
+        biases: *const c_void,
+        c: *mut c_void,
+        n: u32,
+        k: u32,
+        group: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_affine_embed_bf16(
+        tokens: *const c_void,
+        codes: *const c_void,
+        scales: *const c_void,
+        biases: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        hidden: u32,
+        vocab: u32,
+        group: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gemv_bf16_abt(
         a: *const c_void,
         b: *const c_void,
@@ -502,6 +552,13 @@ pub enum KernelError {
         kernel: &'static str,
         dims: [u32; 4],
     },
+    /// An MLX affine kernel (`kernel`, its file's stem) does not take this shape or group;
+    /// `dims` are `[m, n, k, group]` for a GEMM or GEMV (`m` 1), `[rows, hidden, vocab, group]`
+    /// for the embed. Nothing was launched.
+    AffineShape {
+        kernel: &'static str,
+        dims: [u32; 4],
+    },
     /// The launcher's C++ host code threw (caught before it could reach Rust).
     HostException,
     /// A `cudaError_t` from the kernel's one-time setup or from its launch.
@@ -609,6 +666,9 @@ impl fmt::Display for KernelError {
             KernelError::MoeShape { kernel, dims } => {
                 write!(f, "{kernel} refused shape {dims:?}")
             }
+            KernelError::AffineShape { kernel, dims } => {
+                write!(f, "{kernel} refused shape or group {dims:?}")
+            }
             KernelError::HostException => write!(f, "kernel launcher's host code threw"),
             KernelError::Cuda(code) => write!(f, "CUDA error {code}"),
         }
@@ -656,6 +716,18 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
         scratchy_cuda_expert_gemm_e128_col64_bf16_prepare,
     ),
     ("expert_gemv_bf16", scratchy_cuda_expert_gemv_bf16_prepare),
+    (
+        "affine_gemm_bf16_abt",
+        scratchy_cuda_affine_gemm_bf16_abt_prepare,
+    ),
+    (
+        "affine_gemm_col64_bf16_abt",
+        scratchy_cuda_affine_gemm_col64_bf16_abt_prepare,
+    ),
+    (
+        "affine_gemv_bf16_abt",
+        scratchy_cuda_affine_gemv_bf16_abt_prepare,
+    ),
 ];
 
 /// Run every kernel's one-time setup on the current device, stopping at the first failure, which
@@ -2142,6 +2214,175 @@ pub unsafe fn expert_gemv_bf16(
         KernelError::MoeShape {
             kernel: "expert_gemv_bf16",
             dims: [m, top_k, n, k],
+        },
+    )
+}
+
+// THE MLX AFFINE 4-BIT KERNELS (#949): the dequant-fused GEMM (`kernels/affine_gemm_bf16.cu`, two
+// tiles), GEMV (`kernels/affine_gemv_bf16.cu`) and embed gather (`kernels/affine_embed_bf16.cu`).
+// Each reads one `step::affine_weight` buffer through its three regions, `AffineRegions`: the
+// packed codes, then the bf16 scales and biases (group-major for the GEMM and GEMV, row-major for
+// the embed). Each builds every weight the host dequant (`scratchy_quantizations::affine::
+// affine_dequant_b4_to_dtype`, bf16 scales to bf16) builds, bit for bit, and each GEMM's output is
+// its bf16 twin's bits on that dequantized weight. The one group they take is 64
+// (`op_abi::CUDA_AFFINE_FORMS`).
+
+/// The device addresses of one MLX affine weight's three regions (`step::AffineLayout`'s
+/// `weight`, `scales` and `biases` offsets from its buffer's start).
+#[derive(Clone, Copy, Debug)]
+pub struct AffineRegions {
+    pub codes: *const c_void,
+    pub scales: *const c_void,
+    pub biases: *const c_void,
+}
+
+/// Launch the MLX affine GEMM `C = A · dequant(W)ᵀ` on 256-column tiles: `A` is `[m, k]` and `C`
+/// `[m, n]`, row-major bf16, `W` the `[n, k]` affine weight at `w`. Bit-identical to
+/// [`gemm_bf16_abt`] on the host-dequantized weight. Asynchronous.
+///
+/// Refused with [`KernelError::AffineShape`] `{ kernel: "affine_gemm_bf16", dims: [m, n, k, group]
+/// }`, before any pointer is touched, unless `m`, `n` and `k` are non-zero multiples of 128, 256
+/// and 64 (`step::GEMM_BF16_TILE`), none above `i32::MAX`, and `group` is 64.
+///
+/// # Safety
+///
+/// [`prepare_all`] must have succeeded on the current device. `a` and `c` must be 16-byte-aligned
+/// device pointers to at least `m*k` and `m*n` bf16; `w` the regions of a `step::affine_weight(n,
+/// k, 64)` buffer, its scales and biases group-major; all valid for the whole kernel, `c`
+/// overlapping no input. `stream` must be a live `cudaStream_t` of the current device, or null for
+/// the default stream.
+pub unsafe fn affine_gemm_bf16_abt(
+    a: *const c_void,
+    w: AffineRegions,
+    c: *mut c_void,
+    (m, n, k, group): (u32, u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer and catches every C++ exception.
+    let code = unsafe {
+        scratchy_cuda_affine_gemm_bf16_abt(
+            a, w.codes, w.scales, w.biases, c, m, n, k, group, stream,
+        )
+    };
+    check(
+        code,
+        KernelError::AffineShape {
+            kernel: "affine_gemm_bf16",
+            dims: [m, n, k, group],
+        },
+    )
+}
+
+/// [`affine_gemm_bf16_abt`] on 64-column tiles: `m`, `n` and `k` non-zero multiples of 128, 64 and
+/// 64 (`step::GEMM_COL64_TILE`). Bit-identical to [`gemm_col64_bf16_abt`] on the host-dequantized
+/// weight. Refused with [`KernelError::AffineShape`] `{ kernel: "affine_gemm_col64_bf16", .. }`.
+///
+/// # Safety
+///
+/// As [`affine_gemm_bf16_abt`]'s.
+pub unsafe fn affine_gemm_col64_bf16_abt(
+    a: *const c_void,
+    w: AffineRegions,
+    c: *mut c_void,
+    (m, n, k, group): (u32, u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `affine_gemm_bf16_abt`'s.
+    let code = unsafe {
+        scratchy_cuda_affine_gemm_col64_bf16_abt(
+            a, w.codes, w.scales, w.biases, c, m, n, k, group, stream,
+        )
+    };
+    check(
+        code,
+        KernelError::AffineShape {
+            kernel: "affine_gemm_col64_bf16",
+            dims: [m, n, k, group],
+        },
+    )
+}
+
+/// Launch the MLX affine GEMV `c = a · dequant(W)ᵀ`, the one-row affine GEMM: `a` is `[1, k]` and
+/// `c` `[1, n]`, bf16, `W` the `[n, k]` affine weight at `w`. Bit-identical to [`gemv_bf16_abt`]
+/// on the host-dequantized weight; only the `n` elements of `c` are written. Asynchronous.
+///
+/// Refused with [`KernelError::AffineShape`] `{ kernel: "affine_gemv_bf16", dims: [1, n, k, group]
+/// }`, before any pointer is touched, unless `n` is a non-zero multiple of 8, `k` of 64, both at
+/// most `i32::MAX`, and `group` is 64.
+///
+/// # Safety
+///
+/// [`prepare_all`] must have succeeded on the current device. `a` and `c` must be 16-byte-aligned
+/// device pointers to at least `k` and `n` bf16; `w` the regions of a `step::affine_weight(n, k,
+/// 64)` buffer, its scales and biases group-major; all valid for the whole kernel, `c` overlapping
+/// no input. `stream` must be a live `cudaStream_t` of the current device, or null for the default
+/// stream.
+pub unsafe fn affine_gemv_bf16_abt(
+    a: *const c_void,
+    w: AffineRegions,
+    c: *mut c_void,
+    (n, k, group): (u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer and catches every C++ exception.
+    let code = unsafe {
+        scratchy_cuda_affine_gemv_bf16_abt(a, w.codes, w.scales, w.biases, c, n, k, group, stream)
+    };
+    check(
+        code,
+        KernelError::AffineShape {
+            kernel: "affine_gemv_bf16",
+            dims: [1, n, k, group],
+        },
+    )
+}
+
+/// Launch the MLX affine token-embedding gather: `out[r, :] = dequant(table[tokens[r], :])` for
+/// every one of the `rows` rows, padding rows included, each row the host dequant's bits; an id at
+/// or above `vocab` writes a `+0.0` row and reads nothing. Asynchronous.
+///
+/// Refused with [`KernelError::AffineShape`] `{ kernel: "affine_embed_bf16", dims: [rows, hidden,
+/// vocab, group] }`, before any pointer is touched, unless `rows`, `hidden` and `vocab` are
+/// non-zero and at most `i32::MAX`, `hidden` a multiple of 64, `group` 64, and `rows · hidden` at
+/// most `i32::MAX`. No one-time setup, so it is not in [`PREPARE`].
+///
+/// # Safety
+///
+/// `tokens` must be a 4-byte-aligned device pointer to `rows` u32; `out` a 16-byte-aligned device
+/// pointer to at least `rows·hidden` bf16; `table` the regions of a `step::affine_weight(vocab,
+/// hidden, 64)` buffer, its scales and biases row-major; all valid for the whole kernel, `out`
+/// overlapping no input. `stream` must be a live `cudaStream_t` of the current device, or null for
+/// the default stream.
+pub unsafe fn affine_embed_bf16(
+    tokens: *const c_void,
+    table: AffineRegions,
+    out: *mut c_void,
+    (rows, hidden, vocab, group): (u32, u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer.
+    let code = unsafe {
+        scratchy_cuda_affine_embed_bf16(
+            tokens,
+            table.codes,
+            table.scales,
+            table.biases,
+            out,
+            rows,
+            hidden,
+            vocab,
+            group,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::AffineShape {
+            kernel: "affine_embed_bf16",
+            dims: [rows, hidden, vocab, group],
         },
     )
 }

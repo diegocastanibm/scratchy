@@ -50,6 +50,9 @@ scratchy-subtile = { path = "../../compiler/subtile" }
 scratchy-target-cuda-compiler = { path = "compiler" }
 # `weight_table` writes a tiny synthetic checkpoint with `safetensors::serialize`.
 safetensors = { workspace = true }
+# The affine kernels' reference (`affine`, `tape_player`): the host MLX dequant Metal's loader and
+# goldens use, `affine::affine_dequant_b4_to_dtype`, which each kernel must equal bit for bit.
+scratchy-quantizations = { path = "../../models/quantization" }
 
 # The bf16 GEMM against a CPU reference, on the GPU. Not built without `nvcc`.
 [[test]]
@@ -127,4 +130,11 @@ required-features = ["nvcc"]
 # The tape player on the GPU: GEMM chains through the arena against a CPU reference.
 [[test]]
 name = "tape_player"
+required-features = ["nvcc"]
+
+# The MLX affine 4-bit kernels (#949: the dequant-fused GEMM at 256 and 64 columns, the GEMV and
+# the embed gather) against the host dequant and their bf16 twins, bit for bit, on synthetic and
+# real GLM-4.5-Air weights, on the GPU. Not built without `nvcc`.
+[[test]]
+name = "affine"
 required-features = ["nvcc"]
