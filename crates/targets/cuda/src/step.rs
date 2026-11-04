@@ -637,6 +637,10 @@ pub const fn gemv_scratch_bytes(n: u32, pairs: u32, splits: u32) -> Option<u64> 
 /// is non-zero and `rows · cols` at most `i32::MAX`.
 pub const RMS_NORM_BF16_COLS: u32 = 8;
 
+/// The widest row the one-row RMSNorm takes ([`RmsNormBf16::one_row`]): 16 tiles of 256 columns,
+/// each kept in shared memory.
+pub const RMS_NORM_ROW_MAX_COLS: u32 = 4096;
+
 /// `y[r, c] = x[r, c] / rms(x[r, :]) · (offset + gain[c])`, `rms(x) = sqrt(mean(x²) + eps)`,
 /// bf16 in and out, computed in f32 and rounded once.
 ///
@@ -672,6 +676,12 @@ impl RmsNormBf16 {
     /// The norm's `eps`.
     pub const fn eps(&self) -> f32 {
         f32::from_bits(self.eps_bits)
+    }
+
+    /// Whether the norm runs as one row by 8 warps (`kernels/rms_norm_bf16.cu`'s one-row form, the
+    /// same bits): a constant of the step, so of the tape.
+    pub const fn one_row(&self) -> bool {
+        self.rows == 1 && self.cols <= RMS_NORM_ROW_MAX_COLS
     }
 }
 

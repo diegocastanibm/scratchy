@@ -75,6 +75,17 @@ unsafe extern "C" {
         gain_offset: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_rms_norm_row_bf16_prepare() -> i32;
+    fn scratchy_cuda_rms_norm_row_bf16(
+        x: *const c_void,
+        gain: *const c_void,
+        y: *mut c_void,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+        gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_add_rms_norm_bf16(
         a: *const c_void,
         b: *const c_void,
@@ -843,6 +854,7 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("gemv_bf16_abt", scratchy_cuda_gemv_bf16_abt_prepare),
     // Every form of `rms_norm_bf16.cu`: the norm, the unit norm, and #1049's add-norm folds.
     ("rms_norm_bf16", scratchy_cuda_rms_norm_bf16_prepare),
+    ("rms_norm_row_bf16", scratchy_cuda_rms_norm_row_bf16_prepare),
     ("add_bf16", scratchy_cuda_add_bf16_prepare),
     ("silu_mul_bf16", scratchy_cuda_silu_mul_bf16_prepare),
     ("pointwise_bf16", scratchy_cuda_pointwise_bf16_prepare),
@@ -1052,6 +1064,29 @@ pub unsafe fn rms_norm_bf16(
     // shape before it touches a pointer.
     let code =
         unsafe { scratchy_cuda_rms_norm_bf16(x, gain, y, rows, cols, eps, gain_offset, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Launch [`rms_norm_bf16`] of one row by 8 warps (`kernels/rms_norm_bf16.cu`'s one-row form,
+/// [`crate::step::RmsNormBf16::one_row`]): its bits, every tile loaded once. `rows` must be 1 and
+/// `cols` at most [`crate::step::RMS_NORM_ROW_MAX_COLS`], else `RowShape`.
+///
+/// # Safety
+///
+/// As [`rms_norm_bf16`]'s.
+pub unsafe fn rms_norm_row_bf16(
+    x: *const c_void,
+    gain: *const c_void,
+    y: *mut c_void,
+    (rows, cols): (u32, u32),
+    eps: f32,
+    gain_offset: f32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_rms_norm_row_bf16(x, gain, y, rows, cols, eps, gain_offset, stream)
+    };
     check(code, KernelError::RowShape { rows, cols })
 }
 

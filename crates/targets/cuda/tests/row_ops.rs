@@ -20,7 +20,7 @@ use common::numerics::{
     soft_cap_bound, soft_cap_reference, widen,
 };
 use scratchy_target_cuda::kernels::{KernelError, add_bf16, rms_norm_bf16, silu_mul_bf16};
-use scratchy_target_cuda::kernels::{add_rms_norm_bf16, norm_add_bf16};
+use scratchy_target_cuda::kernels::{add_rms_norm_bf16, norm_add_bf16, rms_norm_row_bf16};
 use scratchy_target_cuda::kernels::{
     gelu_mul_bf16, layer_scale_bf16, rms_norm_unit_bf16, scale_bf16, soft_cap_bf16,
 };
@@ -1094,4 +1094,154 @@ fn the_add_norm_folds_are_their_chains_bit_for_bit() {
         pass &= ok;
     }
     assert!(pass, "an add-norm fold differs from its chain");
+}
+
+/// The one-row RMSNorm's widths: the 35B's 2,048, Gemma's 2,816, the 9B's 4,096, 1,024, and the
+/// head widths 256 and 512.
+const ONE_ROW_COLS: [u32; 6] = [256, 512, 1024, 2048, 2816, 4096];
+
+/// The one-row RMSNorm (8 warps, every tile loaded once) writes the bits of `rms_norm_bf16` at
+/// one row, both conventions, with its tail intact.
+#[test]
+fn the_one_row_rms_norm_is_the_norm_bit_for_bit() {
+    let device = h100();
+    let null = std::ptr::null_mut();
+    let up = |v: &[u16]| DeviceBuffer::upload(&device, v).expect("upload");
+    let mut pass = true;
+    for cols in ONE_ROW_COLS {
+        for offset in [SCALE, ONE_PLUS_SCALE] {
+            let (c, seed) = (cols as usize, u64::from(cols) << 8 ^ offset as u64);
+            let x = up(&bf16_inputs(c, 0x1A0E_0000 ^ seed));
+            let g = up(&bf16_inputs(c, 0x1A0E_1000 ^ seed));
+            let (want, got) = (output(&device, c), output(&device, c));
+            // SAFETY: cudaMalloc pointers are 256-byte aligned; `x`, `want` and `got` hold `cols`
+            // elements and `g` `cols`; each output is its own allocation; null is the default
+            // stream, which the downloads wait for.
+            unsafe {
+                rms_norm_bf16(x.ptr(), g.ptr(), want.ptr(), (1, cols), EPS, offset, null)
+                    .expect("rms_norm_bf16 launch");
+                rms_norm_row_bf16(x.ptr(), g.ptr(), got.ptr(), (1, cols), EPS, offset, null)
+                    .expect("rms_norm_row_bf16 launch");
+            }
+            let ((want, _), (got, tail)) = (result(&want, c), result(&got, c));
+            let m = mismatched_bits(&got, &want);
+            let ok = m == 0 && tail;
+            eprintln!(
+                "rms_norm_row_bf16 rows=1 cols={cols} offset={offset}: mismatched_bits={m} \
+                 tail_intact={tail} {}",
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(pass, "the one-row RMSNorm differs from the norm");
+}
+
+unsafe extern "C" {
+    fn cudaEventCreate(event: *mut *mut std::ffi::c_void) -> i32;
+    fn cudaEventRecord(event: *mut std::ffi::c_void, stream: *mut std::ffi::c_void) -> i32;
+    fn cudaEventSynchronize(event: *mut std::ffi::c_void) -> i32;
+    fn cudaEventElapsedTime(
+        ms: *mut f32,
+        start: *mut std::ffi::c_void,
+        end: *mut std::ffi::c_void,
+    ) -> i32;
+    fn cudaMemsetAsync(
+        ptr: *mut std::ffi::c_void,
+        value: i32,
+        bytes: usize,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+}
+
+/// The median of 50 launches after 10 warm-ups, in µs, each bracketed by CUDA events on the
+/// default stream; `flush` (cold) is memset before each launch, outside the events, to evict L2.
+fn event_median_us(flush: Option<&DeviceBuffer>, mut launch: impl FnMut()) -> f64 {
+    let null = std::ptr::null_mut();
+    let mut ev = [null; 2];
+    let mut times = Vec::new();
+    // SAFETY: the events are out-pointers this function owns; `flush` is a live allocation of
+    // `bytes()` bytes; null is the default stream the launchers use.
+    unsafe {
+        assert_eq!(cudaEventCreate(&mut ev[0]), 0);
+        assert_eq!(cudaEventCreate(&mut ev[1]), 0);
+        for i in 0..60 {
+            if let Some(f) = flush {
+                assert_eq!(cudaMemsetAsync(f.ptr(), 0xA5, f.bytes() as usize, null), 0);
+            }
+            assert_eq!(cudaEventRecord(ev[0], null), 0);
+            launch();
+            assert_eq!(cudaEventRecord(ev[1], null), 0);
+            assert_eq!(cudaEventSynchronize(ev[1]), 0);
+            let mut ms = 0f32;
+            assert_eq!(cudaEventElapsedTime(&mut ms, ev[0], ev[1]), 0);
+            if i >= 10 {
+                times.push(f64::from(ms) * 1e3);
+            }
+        }
+    }
+    times.sort_by(f64::total_cmp);
+    times[times.len() / 2]
+}
+
+/// Step 1's gate, recorded: at one row, `rms_norm_bf16`'s plain (`<0>`), add-norm (`<2>`) and
+/// norm-add (`<3>`) forms against the one-row norm, by CUDA events, hot (no flush) and cold (a
+/// 512 MB memset first). The ≤ 6 µs gate is read on the GKE run, not asserted here.
+#[test]
+fn the_one_row_rms_norm_time_is_recorded() {
+    let device = h100();
+    let null = std::ptr::null_mut();
+    let up = |v: &[u16]| DeviceBuffer::upload(&device, v).expect("upload");
+    let flush = up(&vec![0; 256 << 20]);
+    for cols in ONE_ROW_COLS {
+        let c = cols as usize;
+        let (a, b, g) = (
+            up(&bf16_inputs(c, 0x71AE_0000)),
+            up(&bf16_inputs(c, 0x71AE_1000)),
+            up(&bf16_inputs(c, 0x71AE_2000)),
+        );
+        let (sum, y) = (output(&device, c), output(&device, c));
+        let dims = (1, cols);
+        let forms: [(&str, &dyn Fn()); 4] = [
+            // SAFETY (each): as `the_one_row_rms_norm_is_the_norm_bit_for_bit`'s; `sum` and `y`
+            // are their own allocations of `cols` elements.
+            ("rms_norm<0>", &|| unsafe {
+                rms_norm_bf16(a.ptr(), g.ptr(), y.ptr(), dims, EPS, SCALE, null).expect("launch")
+            }),
+            ("add_rms_norm<2>", &|| unsafe {
+                add_rms_norm_bf16(
+                    (a.ptr(), b.ptr()),
+                    g.ptr(),
+                    (sum.ptr(), y.ptr()),
+                    dims,
+                    (EPS, SCALE),
+                    null,
+                )
+                .expect("launch")
+            }),
+            ("norm_add<3>", &|| unsafe {
+                norm_add_bf16(
+                    (a.ptr(), b.ptr()),
+                    g.ptr(),
+                    y.ptr(),
+                    dims,
+                    (EPS, SCALE),
+                    null,
+                )
+                .expect("launch")
+            }),
+            ("rms_norm_row (one-row <0>)", &|| unsafe {
+                rms_norm_row_bf16(a.ptr(), g.ptr(), y.ptr(), dims, EPS, SCALE, null)
+                    .expect("launch")
+            }),
+        ];
+        for (what, launch) in forms {
+            let hot = event_median_us(None, launch);
+            let cold = event_median_us(Some(&flush), launch);
+            eprintln!(
+                "rms_norm timing rows=1 cols={cols} {what}: hot {hot:.1}us, cold {cold:.1}us \
+                 (CUDA events, median of 50 after 10 warm-ups; recorded, not asserted)"
+            );
+        }
+    }
 }

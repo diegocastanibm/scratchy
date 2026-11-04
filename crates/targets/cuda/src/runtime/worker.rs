@@ -1774,9 +1774,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     },
                 ) => {
                     let gain = weights[gain.0 as usize].ptr();
+                    let launch = if norm.one_row() {
+                        kernels::rms_norm_row_bf16
+                    } else {
+                        kernels::rms_norm_bf16
+                    };
                     // SAFETY: as above, for `x` and `y` (`rows*cols`) and `gain` (`cols`).
                     unsafe {
-                        kernels::rms_norm_bf16(
+                        launch(
                             slot(x),
                             gain,
                             slot(y),
