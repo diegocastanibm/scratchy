@@ -462,25 +462,42 @@ __device__ static inline void rv_ternary_map(V& dst, const V& a, const V& b, con
 // approved 2026-11-06): TK at the pin has no `rv<fp8e4m3>` (`types/register/rv.cuh` static_asserts
 // it) and no `move<fp8e4m3>::lds`, so its `load` (`ops/group/memory/vec/shared_to_register.cuh`)
 // does not compile for an fp8 source. The layout is that `load`'s naive one: lane `l`'s slot `w`
-// is element `32w + l`. Slots `w` and `w + 1` widen together, `cvt.rn.f16x2.e4m3x2` on the pair
-// then f16 to f32 (`__nv_cvt_fp8x2_to_halfraw2`, then `__half22float2`, as TK's own fp4 convertor
-// in `common/base_types.cuh` writes it): exact, as every e4m3 value is an f16 and an f32. The low
-// byte is `.x`. One warp, as TK's `load`.
+// is element `32w + l`. One warp, as TK's `load`.
+//
+// The widen is integer arithmetic, not the SM's conversion unit (FP8 S8 W2; the user's
+// 2026-11-07 decision: the same gap, its body changed): `cvt.rn.f16x2.e4m3x2` issues at 16 results
+// per clock per SM, which capped the fp8 GEMV near 1.8 TB/s (/tmp/a-s8-plan.md §0.2). For an e4m3
+// byte `x` (sign `s`, exponent field `e`, mantissa `m`), exactly:
+//   - `e != 0` (normal): f32 bits `s << 31 | ((x & 0x7F) << 20) + (120 << 23)`, the exponent
+//     rebiased from 7 to 127 and the mantissa's 3 bits moved to f32's top 3;
+//   - `e == 0` (zero and the 7 subnormals `m · 2⁻⁹`): `(bits(0x4B000000 | m) − 2²³) · 2⁻⁹`, signed.
+//     `0x4B000000 | m` is the f32 `2²³ + m`, so the subtraction gives `m` exactly and the product
+//     `m · 2⁻⁹` is a normal f32 (at least 2⁻⁹): never flushed by `--use_fast_math`'s ftz. (An f32
+//     subnormal bit pattern scaled by 2¹²⁰ would be: it reads as 0 under ftz.)
+//   - `(x & 0x7F) == 0x7F` (NaN): a quiet f32 NaN of the same sign, selected.
+// Every e4m3 value is an f32 value, so this is the bits `cvt` to f16 then f32 gave
+// (`tests/gemv_fp8.rs` checks all 256 bytes against `__nv_cvt_fp8_to_halfraw`, bit for bit).
+// It runs on the integer and FMA pipes at 64 or more results per clock per SM.
+__device__ static inline float e4m3_to_f32(uint32_t x) {
+    const uint32_t sign = (x & 0x80u) << 24;
+    const uint32_t mag = x & 0x7Fu;
+    const float normal = __uint_as_float(sign | ((mag << 20) + (120u << 23)));
+    const float sub = (__uint_as_float(0x4B000000u | mag) - 8388608.0f) * 0.001953125f;
+    const float subnormal = __uint_as_float(sign | __float_as_uint(sub));
+    const float nan = __uint_as_float(sign | 0x7FC00000u);
+    const float v = (mag >> 3) != 0 ? normal : subnormal;
+    return mag == 0x7Fu ? nan : v;
+}
 template <kittens::ducks::rv::naive_layout RV, kittens::ducks::sv::all SV>
 __device__ static inline void sv_fp8_to_rv_fl(RV& dst, const SV& src) {
     static_assert(std::is_same_v<typename SV::dtype, kittens::fp8e4m3>, "an e4m3 shared vector");
     static_assert(std::is_same_v<typename RV::dtype, float>, "a naive f32 register vector");
-    static_assert(SV::length == RV::length && RV::length % 64 == 0, "whole pairs of 32-wide slots");
+    static_assert(SV::length == RV::length && RV::length % 32 == 0, "whole 32-wide slots");
     const int lane = kittens::laneid();
     __syncwarp();
 #pragma unroll
-    for (int w = 0; w < RV::outer_dim; w += 2) {
-        const __nv_fp8x2_storage_t lo = src[32 * w + lane].__x;
-        const __nv_fp8x2_storage_t hi = src[32 * (w + 1) + lane].__x;
-        const __nv_fp8x2_storage_t pair = __nv_fp8x2_storage_t(lo | (hi << 8));
-        const float2 f = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(pair, __NV_E4M3)));
-        dst[w][0] = f.x;
-        dst[w + 1][0] = f.y;
+    for (int w = 0; w < RV::outer_dim; w++) {
+        dst[w][0] = e4m3_to_f32(uint32_t(src[32 * w + lane].__x));
     }
 }
 // TK-GAP(sv_fp8_to_rv_fl) end

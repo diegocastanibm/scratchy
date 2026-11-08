@@ -933,3 +933,132 @@ fn the_fp8_gemv_bandwidth_is_recorded() {
         }
     }
 }
+
+// ── FP8 S8 W2: the integer widen ───────────────────────────────────
+
+/// FP8 S8 W2: the fp8 GEMV's widen (`sv_fp8_to_rv_fl`, now an integer exponent rebias, the
+/// subnormals as `(bits(0x4B000000 | m) − 2²³) · 2⁻⁹`, NaN selected) gives, for every one of the
+/// 256 e4m3 bytes, the f32 bits of ThunderKittens' element convertor (cuda_fp8's
+/// `__nv_cvt_fp8_to_halfraw`, then f16 to f32), bit for bit, signed zeros and the 14 subnormals
+/// included; every NaN a NaN of the same sign. And each value is the host's exact e4m3 value.
+#[test]
+fn the_integer_widen_is_the_conversion_unit_s_widen_for_every_byte() {
+    use scratchy_target_cuda::kernels::gemv_fp8_widen_probe;
+    let device = h100();
+    let bytes: Vec<u8> = (0..=255u8).collect();
+    let b = DeviceBuffer::upload_bytes(&device, &bytes).expect("upload the bytes");
+    let out = DeviceBuffer::upload_bytes(&device, &[0xA5u8; 512 * 4]).expect("upload out");
+    // SAFETY: cudaMalloc pointers are 256-byte aligned; `b` holds 256 bytes and `out` 512 f32, two
+    // allocations; null is the default stream, which the download below waits for.
+    unsafe { gemv_fp8_widen_probe(b.ptr(), out.ptr(), std::ptr::null_mut()) }
+        .expect("gemv_fp8_widen_probe launch");
+    let got = down_f32(&out);
+    let (widen, cvt) = (&got[..256], &got[256..512]);
+    let mut bad = Vec::new();
+    for x in 0..256usize {
+        let (w, c, host) = (widen[x], cvt[x], e4m3_value(x as u8));
+        let ok = if host.is_nan() {
+            w.is_nan() && c.is_nan() && w.is_sign_negative() == c.is_sign_negative()
+        } else {
+            w.to_bits() == c.to_bits() && f64::from(w) == host && w.is_sign_negative() == (x >= 128)
+        };
+        if !ok {
+            bad.push((x, w, c, host));
+        }
+    }
+    let subnormals = (1..8).chain(129..136).filter(|&x| widen[x] != 0.0).count();
+    eprintln!(
+        "integer widen, 256 e4m3 bytes vs __nv_cvt_fp8_to_halfraw: mismatched={} nonzero_subnormals={subnormals}/14 {:?} {}",
+        bad.len(),
+        &bad[..bad.len().min(8)],
+        verdict(bad.is_empty() && subnormals == 14)
+    );
+    assert!(
+        bad.is_empty() && subnormals == 14,
+        "the integer widen differs from the conversion unit's on some e4m3 byte"
+    );
+}
+
+/// FP8 S8 W2's measure-first gate (the plan's "stop if below 2.4 TB/s cold"): the 27B's MLP
+/// shapes (gate+up 34,816 x 5,120, i.e. 17,408 x 2 rows over 5,120; down 5,120 x 17,408) and its
+/// GDN `qkv + z` group (10,240 and 6,144 over 5,120), cold (L2 cleared) and hot, by CUDA events,
+/// as TB/s of the e4m3 weight bytes. Recorded, not asserted; kernels.sh prints the gate line.
+#[test]
+fn the_w2_fp8_gemv_bandwidth_is_recorded() {
+    let device = h100();
+    let scrub = DeviceBuffer::upload_bytes(&device, &vec![0u8; SCRUB_BYTES]).expect("scrub");
+    for (n, k, what) in [
+        (34816u32, 5120u32, "27B gate+up"),
+        (5120, 17408, "27B down"),
+    ] {
+        let (nu, ku) = (n as usize, k as usize);
+        let x = DeviceBuffer::upload(&device, &bf16_inputs(ku, 0x8F0)).expect("x");
+        let (bq, b_s) = weight(nu, ku, 0x8F1);
+        let w = Fp8Buf::new(&device, &bq, &b_s);
+        let c = DeviceBuffer::upload(&device, &vec![0u16; nu]).expect("c");
+        let splits = gemv_splits(n, k, 1);
+        let p = scratch(&device, gemv_scratch_bytes(n, 1, splits).expect("bytes"));
+        for (temp, sc) in [("cold", Some(&scrub)), ("hot", None)] {
+            let (med, lo, hi) = event_times(sc, || {
+                // SAFETY: as `run_gemv`'s.
+                unsafe {
+                    gemv_fp8_abt(
+                        (x.ptr().cast_const(), w.op(), c.ptr()),
+                        p.ptr(),
+                        (n, k, splits),
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("launch");
+            });
+            eprintln!(
+                "W2 gemv_fp8 time {temp} n={n} k={k} splits={splits}: median={med:.1}us \
+                 min={lo:.1}us max={hi:.1}us {:.2} TB/s ({what})",
+                (nu * ku) as f64 / med / 1e6
+            );
+        }
+    }
+    let (ns, k) = ([10240u32, 6144], 5120u32);
+    let ku = k as usize;
+    let xb = DeviceBuffer::upload(&device, &bf16_inputs(ku, 0x8F2)).expect("x");
+    let ws: Vec<Fp8Buf> = (ns.iter().enumerate())
+        .map(|(i, &n)| {
+            let (q, s) = weight(n as usize, ku, 0x8F3 ^ i as u64);
+            Fp8Buf::new(&device, &q, &s)
+        })
+        .collect();
+    let splits: Vec<u32> = ns.iter().map(|&n| gemv_splits(n, k, 1)).collect();
+    let outs: Vec<DeviceBuffer> = (ns.iter())
+        .map(|&n| DeviceBuffer::upload(&device, &vec![0u16; n as usize]).expect("c"))
+        .collect();
+    let parts: Vec<DeviceBuffer> = (ns.iter().zip(&splits))
+        .map(|(&n, &s)| scratch(&device, gemv_scratch_bytes(n, 1, s).expect("bytes")))
+        .collect();
+    let members: Vec<(Fp8Operand, *mut c_void, u32)> = (ws.iter().zip(&outs).zip(&ns))
+        .map(|((w, c), &n)| (w.op(), c.ptr(), n))
+        .collect();
+    let pp: Vec<*mut c_void> = (parts.iter().zip(&splits))
+        .map(|(p, &s)| if s > 1 { p.ptr() } else { std::ptr::null_mut() })
+        .collect();
+    let bytes: usize = ns.iter().map(|&n| n as usize * ku).sum();
+    for (temp, sc) in [("cold", Some(&scrub)), ("hot", None)] {
+        let (med, lo, hi) = event_times(sc, || {
+            // SAFETY: as `gemv_group_fp8_is_each_member_s_own_gemv`'s.
+            unsafe {
+                gemv_group_fp8_abt(
+                    xb.ptr().cast_const(),
+                    &members,
+                    &pp,
+                    (k, &splits),
+                    std::ptr::null_mut(),
+                )
+            }
+            .expect("group launch");
+        });
+        eprintln!(
+            "W2 gemv_group_fp8 time {temp} n={ns:?} k={k} splits={splits:?}: median={med:.1}us \
+             min={lo:.1}us max={hi:.1}us {:.2} TB/s (27B GDN qkv + z)",
+            bytes as f64 / med / 1e6
+        );
+    }
+}
