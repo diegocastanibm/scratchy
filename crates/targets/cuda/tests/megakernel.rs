@@ -9,21 +9,26 @@
 
 // `pub`: each test binary uses a different part of `common`, and nothing in it is dead code.
 pub mod common {
+    pub mod numerics;
     pub mod watchdog;
 }
 
+use common::numerics::{bf16_inputs, mismatched_bits};
 use scratchy_target_cuda::kernels::{
-    KernelError, MK_INSTRUCTION_WIDTH, MK_OP_CHAIN, MK_OP_NOOP, MK_OP_PAGE_ECHO, MK_PAGE_FLOATS,
-    MK_WORKERS, mk_test,
+    KernelError, MK_INSTRUCTION_WIDTH, MK_MLP_DOWN_BLOCKS, MK_MLP_GATE_UP_BLOCKS, MK_MLP_HIDDEN,
+    MK_MLP_INTER, MK_MLP_WORKERS, MK_OP_CHAIN, MK_OP_DOWN, MK_OP_GATE_UP, MK_OP_NOOP,
+    MK_OP_PAGE_ECHO, MK_PAGE_FLOATS, MK_WORKERS, MkMlpWeights, gate_up_gemv_fp8, gemv_fp8_residual,
+    mk_mlp_test, mk_test, rms_norm_bf16,
 };
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
+use scratchy_target_cuda::step::GatedOp;
 
 fn h100() -> CudaDevice {
     common::watchdog::arm();
     CudaDevice::open().expect("an H100: these tests run only where one is (GKE)")
 }
 
-/// `[MK_WORKERS, n, MK_INSTRUCTION_WIDTH]` i32, every instruction `OP_NOOP`.
+/// `[workers, n, MK_INSTRUCTION_WIDTH]` i32, every instruction `OP_NOOP`.
 struct Lists {
     n: usize,
     words: Vec<i32>,
@@ -31,9 +36,13 @@ struct Lists {
 
 impl Lists {
     fn new(n: usize) -> Self {
+        Self::of(MK_WORKERS, n)
+    }
+
+    fn of(workers: usize, n: usize) -> Self {
         Self {
             n,
-            words: vec![MK_OP_NOOP; MK_WORKERS * n * MK_INSTRUCTION_WIDTH],
+            words: vec![MK_OP_NOOP; workers * n * MK_INSTRUCTION_WIDTH],
         }
     }
 
@@ -204,4 +213,355 @@ fn the_interpreter_plays_a_cross_sm_chain_and_its_pages() {
         pass &= ok;
     }
     assert!(pass, "the interpreter failed: see the lines above");
+}
+
+// ── M0 Day 2: Gemma's dense-MLP block, the go/no-go ────────────────
+
+/// Gemma 4 26B-A4B's pre-feedforward norm: eps, and its `Scale` gain convention's offset.
+const MLP_EPS: f32 = 1e-6;
+const MLP_GAIN_OFFSET: f32 = 0.0;
+/// Gemma's dense MLP activation, GeGLU (`GatedOp::Gelu`).
+const MLP_ACT: GatedOp = GatedOp::Gelu;
+
+/// `layers` of synthetic weights, on the device: random bf16 gains and inputs, random e4m3 bytes
+/// (no NaN) and positive per-channel f32 scales, so each layer's output stays in range.
+struct Mlp {
+    layers: usize,
+    h0: Vec<u16>,
+    gain: DeviceBuffer,
+    gate: (DeviceBuffer, DeviceBuffer),
+    up: (DeviceBuffer, DeviceBuffer),
+    down: (DeviceBuffer, DeviceBuffer),
+}
+
+/// Random e4m3 bytes, never a NaN (`0x7F`/`0xFF`): the sign and every exponent and mantissa.
+fn e4m3_bytes(len: usize, seed: u64) -> Vec<u8> {
+    (bf16_inputs(len, seed).into_iter().enumerate())
+        .map(|(i, b)| {
+            let v = (b as u8) ^ (i as u8).wrapping_mul(37);
+            if v & 0x7F == 0x7F { v & 0xFE } else { v }
+        })
+        .collect()
+}
+
+/// Positive per-channel scales near `1 / (sqrt(k) · 16)`, so a row's products sum to O(1).
+fn scales(len: usize, k: usize, seed: u64) -> Vec<u8> {
+    let base = 1.0 / ((k as f32).sqrt() * 16.0);
+    (bf16_inputs(len, seed).into_iter())
+        .map(|b| base * (1.25 + 0.5 * half::bf16::from_bits(b).to_f32()))
+        .flat_map(f32::to_le_bytes)
+        .collect()
+}
+
+fn mlp(device: &CudaDevice, layers: usize, seed: u64) -> Mlp {
+    let (h, i) = (MK_MLP_HIDDEN, MK_MLP_INTER);
+    let up = |b: &[u8]| DeviceBuffer::upload_bytes(device, b).expect("upload");
+    let gain: Vec<u16> = (bf16_inputs(layers * h, seed ^ 1).into_iter())
+        .map(|b| half::bf16::from_f32(1.0 + 0.25 * half::bf16::from_bits(b).to_f32()).to_bits())
+        .collect();
+    let gain_bytes: Vec<u8> = gain.iter().flat_map(|b| b.to_le_bytes()).collect();
+    Mlp {
+        layers,
+        h0: bf16_inputs(h, seed ^ 2),
+        gain: up(&gain_bytes),
+        gate: (
+            up(&e4m3_bytes(layers * i * h, seed ^ 3)),
+            up(&scales(layers * i, h, seed ^ 4)),
+        ),
+        up: (
+            up(&e4m3_bytes(layers * i * h, seed ^ 5)),
+            up(&scales(layers * i, h, seed ^ 6)),
+        ),
+        down: (
+            up(&e4m3_bytes(layers * h * i, seed ^ 7)),
+            up(&scales(layers * h, i, seed ^ 8)),
+        ),
+    }
+}
+
+/// Byte offset `at` into `b`.
+fn at(b: &DeviceBuffer, at: usize) -> *mut std::ffi::c_void {
+    b.ptr().cast::<u8>().wrapping_add(at).cast()
+}
+
+/// Today's launch chain over every layer, on the default stream: per layer the one-row RMSNorm,
+/// the fp8 gate/up GEMV + GeLU and the fp8 down GEMV with the residual epilogue, each at one split
+/// (`gemv_splits` at these shapes), exactly as the decode tape launches them. `h` (`[layers + 1,
+/// hidden]`) holds the input in row 0; returns every row.
+fn chain(device: &CudaDevice, m: &Mlp, launch: &mut dyn FnMut(&mut dyn FnMut())) -> Vec<u16> {
+    let (hd, i) = (MK_MLP_HIDDEN, MK_MLP_INTER);
+    let mut h0 = m.h0.clone();
+    h0.resize((m.layers + 1) * hd, 0);
+    let h = DeviceBuffer::upload(device, &h0).expect("h");
+    let n = DeviceBuffer::upload(device, &vec![0u16; hd]).expect("n");
+    let act = DeviceBuffer::upload(device, &vec![0u16; i]).expect("act");
+    let null = std::ptr::null_mut();
+    launch(&mut || {
+        for l in 0..m.layers {
+            // SAFETY: every operand is its layer's slice of a buffer of its size; one split, so no
+            // partials; null is the default stream.
+            unsafe {
+                rms_norm_bf16(
+                    at(&h, 2 * l * hd).cast_const(),
+                    at(&m.gain, 2 * l * hd).cast_const(),
+                    n.ptr(),
+                    (1, hd as u32),
+                    MLP_EPS,
+                    MLP_GAIN_OFFSET,
+                    null,
+                )
+                .expect("norm");
+                gate_up_gemv_fp8(
+                    (
+                        n.ptr().cast_const(),
+                        (
+                            at(&m.gate.0, l * i * hd).cast_const(),
+                            at(&m.gate.1, 4 * l * i).cast_const(),
+                        ),
+                        (
+                            at(&m.up.0, l * i * hd).cast_const(),
+                            at(&m.up.1, 4 * l * i).cast_const(),
+                        ),
+                    ),
+                    (act.ptr(), null),
+                    (i as u32, hd as u32, 1),
+                    MLP_ACT.code(),
+                    null,
+                )
+                .expect("gate/up");
+                gemv_fp8_residual(
+                    (
+                        act.ptr().cast_const(),
+                        (
+                            at(&m.down.0, l * hd * i).cast_const(),
+                            at(&m.down.1, 4 * l * hd).cast_const(),
+                        ),
+                        at(&h, 2 * (l + 1) * hd),
+                    ),
+                    null,
+                    (hd as u32, i as u32, 1),
+                    at(&h, 2 * l * hd).cast_const(),
+                    null,
+                )
+                .expect("down");
+            }
+        }
+    });
+    h.download().expect("h")
+}
+
+/// The MLP program's lists for `layers`: layer `L`'s 66 gate/up blocks, then its 176 down blocks,
+/// dealt round robin over the 132 workers in that order, so each worker's list is in layer order.
+/// A gate/up block of layer L > 0 waits for layer L − 1's 176 down blocks (counter `2L − 1`); a
+/// down block of layer L for its 66 gate/up blocks (counter `2L`); each publishes its own.
+fn mlp_lists(layers: usize) -> Lists {
+    let mut per: Vec<Vec<[i32; 6]>> = vec![Vec::new(); MK_MLP_WORKERS];
+    let mut next = 0usize;
+    for l in 0..layers as i32 {
+        for b in 0..MK_MLP_GATE_UP_BLOCKS as i32 {
+            let (wait, want) = if l == 0 {
+                (0, 0)
+            } else {
+                (2 * l - 1, MK_MLP_DOWN_BLOCKS as i32)
+            };
+            per[next % MK_MLP_WORKERS].push([MK_OP_GATE_UP, l, b, wait, want, 2 * l]);
+            next += 1;
+        }
+        for b in 0..MK_MLP_DOWN_BLOCKS as i32 {
+            per[next % MK_MLP_WORKERS].push([
+                MK_OP_DOWN,
+                l,
+                b,
+                2 * l,
+                MK_MLP_GATE_UP_BLOCKS as i32,
+                2 * l + 1,
+            ]);
+            next += 1;
+        }
+    }
+    let n = per.iter().map(Vec::len).max().unwrap_or(1);
+    let mut lists = Lists::of(MK_MLP_WORKERS, n);
+    for (w, ins) in per.iter().enumerate() {
+        for (i, a) in ins.iter().enumerate() {
+            lists.set(w, i, a[0], &a[1..]);
+        }
+    }
+    lists
+}
+
+/// The megakernel over every layer: returns `h`'s rows.
+fn megakernel(device: &CudaDevice, m: &Mlp, launch: &mut dyn FnMut(&mut dyn FnMut())) -> Vec<u16> {
+    let (hd, i) = (MK_MLP_HIDDEN, MK_MLP_INTER);
+    let lists = mlp_lists(m.layers);
+    let counters = 2 * m.layers;
+    let mut h0 = m.h0.clone();
+    h0.resize((m.layers + 1) * hd, 0);
+    let h = DeviceBuffer::upload(device, &h0).expect("h");
+    let act = DeviceBuffer::upload(device, &vec![0u16; m.layers * i]).expect("act");
+    let ins = DeviceBuffer::upload_bytes(device, &lists.bytes()).expect("lists");
+    let c = DeviceBuffer::upload_bytes(device, &vec![0u8; 4 * counters]).expect("counters");
+    let w = MkMlpWeights {
+        gain: m.gain.ptr().cast_const(),
+        gate: (m.gate.0.ptr().cast_const(), m.gate.1.ptr().cast_const()),
+        up: (m.up.0.ptr().cast_const(), m.up.1.ptr().cast_const()),
+        down: (m.down.0.ptr().cast_const(), m.down.1.ptr().cast_const()),
+    };
+    launch(&mut || {
+        // The counters start at zero for every play.
+        // SAFETY: `c` holds `counters` u32; null is the default stream.
+        unsafe { cuda_memset(c.ptr(), 4 * counters) };
+        // SAFETY: every buffer holds what the lists index; every wait's count is published by the
+        // lists (`mlp_lists`); null is the default stream.
+        unsafe {
+            mk_mlp_test(
+                (ins.ptr().cast_const(), lists.n as u32),
+                (c.ptr(), counters as u32),
+                (h.ptr(), act.ptr()),
+                w,
+                (m.layers as u32, MLP_EPS, MLP_GAIN_OFFSET),
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("megakernel");
+    });
+    h.download().expect("h")
+}
+
+unsafe extern "C" {
+    fn cudaMemsetAsync(
+        dst: *mut std::ffi::c_void,
+        value: i32,
+        bytes: usize,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+    fn cudaEventCreate(event: *mut CudaEvent) -> i32;
+    fn cudaEventRecord(event: CudaEvent, stream: *mut std::ffi::c_void) -> i32;
+    fn cudaEventSynchronize(event: CudaEvent) -> i32;
+    fn cudaEventElapsedTime(ms: *mut f32, start: CudaEvent, end: CudaEvent) -> i32;
+    fn cudaEventDestroy(event: CudaEvent) -> i32;
+}
+
+/// `cudaEvent_t`, declared here for the timing lines only (the runtime declares no event call).
+type CudaEvent = *mut std::ffi::c_void;
+
+/// Zero `bytes` bytes at `dst` on the default stream.
+///
+/// # Safety
+///
+/// `dst` a device pointer to at least `bytes` bytes.
+unsafe fn cuda_memset(dst: *mut std::ffi::c_void, bytes: usize) {
+    // SAFETY: the caller's contract.
+    assert_eq!(
+        unsafe { cudaMemsetAsync(dst, 0, bytes, std::ptr::null_mut()) },
+        0,
+        "memset"
+    );
+}
+
+/// Run `f` once.
+fn once(f: &mut dyn FnMut()) {
+    f();
+}
+
+/// The bits gate (the user's decision 2026-11-10: the megakernel is bit-identical to today's
+/// launch chain): Gemma's dense-MLP block on synthetic weights, 1 layer and 30 layers chained, every
+/// output row of every layer `mismatched_bits=0` against the chain, at 3 seeds for 1 layer.
+#[test]
+fn the_megakernel_mlp_block_is_its_launch_chain_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for (layers, seeds) in [(1usize, 3u64), (30, 1)] {
+        for seed in 0..seeds {
+            let m = mlp(&device, layers, 0x4D30 ^ seed << 8 ^ layers as u64);
+            let want = chain(&device, &m, &mut once);
+            let got = megakernel(&device, &m, &mut once);
+            let hd = MK_MLP_HIDDEN;
+            let bad = mismatched_bits(&got[hd..], &want[hd..]);
+            let first = (1..=layers)
+                .find(|&l| mismatched_bits(&got[l * hd..][..hd], &want[l * hd..][..hd]) != 0);
+            let ok = bad == 0;
+            eprintln!(
+                "M0 mlp block layers={layers} seed={seed}: mismatched_bits={bad} first_bad_layer={first:?} {}",
+                if ok { "PASS" } else { "FAIL" }
+            );
+            pass &= ok;
+        }
+    }
+    assert!(
+        pass,
+        "the megakernel's MLP block differs from today's chain: see the lines above"
+    );
+}
+
+/// The median µs of 20 plays of `f` after 3 warm-ups, each between two CUDA events on the default
+/// stream (hot: the 30 layers' 0.53 GB of weights exceed L2, so each play streams them).
+fn event_median(f: &mut dyn FnMut()) -> f64 {
+    let (mut start, mut end): (CudaEvent, CudaEvent) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: plain runtime calls on the default stream with out-pointers to locals; each event is
+    // destroyed below.
+    unsafe {
+        assert_eq!(cudaEventCreate(&mut start), 0, "cudaEventCreate");
+        assert_eq!(cudaEventCreate(&mut end), 0, "cudaEventCreate");
+    }
+    let mut times = Vec::new();
+    for i in 0..23 {
+        let mut ms = 0.0f32;
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(cudaEventRecord(start, std::ptr::null_mut()), 0, "record");
+            f();
+            assert_eq!(cudaEventRecord(end, std::ptr::null_mut()), 0, "record");
+            assert_eq!(cudaEventSynchronize(end), 0, "synchronize");
+            assert_eq!(cudaEventElapsedTime(&mut ms, start, end), 0, "elapsed");
+        }
+        if i >= 3 {
+            times.push(f64::from(ms) * 1e3);
+        }
+    }
+    // SAFETY: both events were created above and are no longer used.
+    unsafe {
+        cudaEventDestroy(start);
+        cudaEventDestroy(end);
+    }
+    times.sort_by(f64::total_cmp);
+    times[times.len() / 2]
+}
+
+/// Today's in-tape µs of the same launches, 30 layers, from the W4c Gemma trace at input 128
+/// (/tmp/w4prof-an/an-gemma-128.md, decode token 64, `tok-node-128.sqlite`): per layer the
+/// pre-feedforward `rms_norm_one_row_ker<0>` 8.46 + `gate_up_gemv_fp8_ker<false, gelu>` 24.09 +
+/// `gemv_fp8_ker<false, 2>` 11.03 = 43.59 µs, × 30.
+const TODAY_IN_TAPE_US: f64 = 1307.6;
+/// The gate (the user's decision 2026-11-10): at least 25% faster.
+const GATE_SPEEDUP: f64 = 0.25;
+
+/// M0's go/no-go, recorded: the 30 layers in one persistent launch against today's chain of 90
+/// launches, both timed here by CUDA events (the chain as stream launches, not a graph), and
+/// against today's in-tape sum of the same kernels. `GATE M0 … PASS` when the megakernel is at
+/// least 25% faster than the in-tape sum; else `FAIL`, and the megakernel is dropped. Recorded, not
+/// asserted: the gate is read off the line.
+#[test]
+fn the_megakernel_mlp_time_is_recorded() {
+    let device = h100();
+    let m = mlp(&device, 30, 0x4D40);
+    let mut chain_us = 0.0;
+    chain(&device, &m, &mut |f| chain_us = event_median(f));
+    let mut mk_us = 0.0;
+    megakernel(&device, &m, &mut |f| mk_us = event_median(f));
+    let speedup = 1.0 - mk_us / TODAY_IN_TAPE_US;
+    eprintln!(
+        "M0 mlp time 30 layers: megakernel {mk_us:.1} us; chain here {chain_us:.1} us (stream \
+         launches); today's in-tape {TODAY_IN_TAPE_US:.1} us (recorded, not asserted)"
+    );
+    eprintln!(
+        "GATE M0 megakernel {mk_us:.1} us vs in-tape {TODAY_IN_TAPE_US:.1} us: {:.1}% faster (want \
+         >= {:.0}%) {}",
+        100.0 * speedup,
+        100.0 * GATE_SPEEDUP,
+        if speedup >= GATE_SPEEDUP {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    );
 }

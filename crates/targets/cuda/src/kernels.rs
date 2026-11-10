@@ -682,6 +682,25 @@ unsafe extern "C" {
         rows: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_mk_mlp_test(
+        instructions: *const c_void,
+        n: u32,
+        counters: *mut c_void,
+        counter_count: u32,
+        h: *mut c_void,
+        gain: *const c_void,
+        gate: *const c_void,
+        gate_scale: *const c_void,
+        up: *const c_void,
+        up_scale: *const c_void,
+        down: *const c_void,
+        down_scale: *const c_void,
+        act: *mut c_void,
+        layers: u32,
+        eps: f32,
+        gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_tma_box_probe_store(
         pattern: *const c_void,
         dst: *mut c_void,
@@ -2318,6 +2337,88 @@ pub const MK_PAGE_FLOATS: usize = 4096;
 pub const MK_OP_NOOP: i32 = 0;
 pub const MK_OP_CHAIN: i32 = 1;
 pub const MK_OP_PAGE_ECHO: i32 = 2;
+/// The M0 MLP program's opcodes ([`mk_mlp_test`]): Gemma's normed gate/up GEMV + GeLU of one
+/// 32-row block, and its down GEMV + residual of one 16-row block.
+pub const MK_OP_GATE_UP: i32 = 3;
+pub const MK_OP_DOWN: i32 = 4;
+/// The MLP program's workers: one lane per SM.
+pub const MK_MLP_WORKERS: usize = 132;
+/// Gemma 4 26B-A4B's dense MLP, the one [`mk_mlp_test`] plays: hidden, intermediate, and the gate/up
+/// and down GEMVs' blocks (`kernels/gemv_fp8.cu`'s grids at these shapes, one split).
+pub const MK_MLP_HIDDEN: usize = 2816;
+pub const MK_MLP_INTER: usize = 2112;
+pub const MK_MLP_GATE_UP_BLOCKS: usize = 66;
+pub const MK_MLP_DOWN_BLOCKS: usize = 176;
+
+/// The MLP program's per-layer weights ([`mk_mlp_test`]): each a device pointer to all layers'.
+#[derive(Clone, Copy, Debug)]
+pub struct MkMlpWeights {
+    /// `[layers, MK_MLP_HIDDEN]` bf16, the pre-feedforward norm's gain.
+    pub gain: *const c_void,
+    /// `[layers, MK_MLP_INTER, MK_MLP_HIDDEN]` e4m3 and `[layers, MK_MLP_INTER]` f32.
+    pub gate: Fp8Operand,
+    /// As `gate`.
+    pub up: Fp8Operand,
+    /// `[layers, MK_MLP_HIDDEN, MK_MLP_INTER]` e4m3 and `[layers, MK_MLP_HIDDEN]` f32.
+    pub down: Fp8Operand,
+}
+
+/// Test support for `tests/megakernel.rs` only (FP8 S8 M0's go/no-go). Play `instructions`
+/// (`[MK_MLP_WORKERS, n, MK_INSTRUCTION_WIDTH]` i32) of the MLP program over `layers` of Gemma's
+/// dense MLP in one cooperative launch of 132 persistent CTAs: `h` (`[layers + 1, MK_MLP_HIDDEN]`
+/// bf16) holds the input in row 0 and gets layer `L`'s output in row `L + 1`, each `y = x +
+/// down(gelu_tanh_mul(gate(n), up(n)))`, `n` the RMSNorm of `x` (`eps`, `gain_offset`); `act`
+/// (`[layers, MK_MLP_INTER]` bf16) gets each layer's activation; `counters` (`counter_count` u32,
+/// zeroed by the caller) order the instructions. Refused with [`KernelError::MkShape`] (`[n,
+/// counter_count, layers, 0]`) when a count is zero or above `i32::MAX`, `eps` is not finite and
+/// positive, or the device has not 132 SMs. Asynchronous.
+///
+/// # Safety
+///
+/// Every pointer a 16-byte-aligned device pointer to its elements, valid for the whole kernel; `h`
+/// and `act` overlap nothing else. Every argument word an instruction reads indexes inside its
+/// buffer, and every count an instruction waits for is published by another instruction of the
+/// list, or the launch never ends. [`prepare_all`] must have succeeded on the current device;
+/// `stream` a live `cudaStream_t` of it, or null for the default stream.
+#[doc(hidden)]
+pub unsafe fn mk_mlp_test(
+    (instructions, n): (*const c_void, u32),
+    (counters, counter_count): (*mut c_void, u32),
+    (h, act): (*mut c_void, *mut c_void),
+    w: MkMlpWeights,
+    (layers, eps, gain_offset): (u32, f32, f32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // counts before it touches a pointer and catches every C++ exception.
+    let code = unsafe {
+        scratchy_cuda_mk_mlp_test(
+            instructions,
+            n,
+            counters,
+            counter_count,
+            h,
+            w.gain,
+            w.gate.0,
+            w.gate.1,
+            w.up.0,
+            w.up.1,
+            w.down.0,
+            w.down.1,
+            act,
+            layers,
+            eps,
+            gain_offset,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::MkShape {
+            dims: [n, counter_count, layers, 0],
+        },
+    )
+}
 
 /// Test support for `tests/megakernel.rs` only. Play `instructions` (`[MK_WORKERS, n,
 /// MK_INSTRUCTION_WIDTH]` i32) in one cooperative launch of 132 persistent CTAs, over the counters
