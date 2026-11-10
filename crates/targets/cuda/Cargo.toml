@@ -155,3 +155,9 @@ required-features = ["nvcc"]
 [[test]]
 name = "tape_player"
 required-features = ["nvcc"]
+
+# The megakernel's interpreter (FP8 S8 M0): its persistent loop, ring, pages and cross-SM
+# counters, on the H100. Not built without nvcc.
+[[test]]
+name = "megakernel"
+required-features = ["nvcc"]

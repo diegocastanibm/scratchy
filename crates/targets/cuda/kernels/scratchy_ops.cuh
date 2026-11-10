@@ -494,5 +494,40 @@ __device__ static inline void sv_fp8_to_rv_fl(RV& dst, const SV& src) {
 }
 // TK-GAP(sv_fp8_to_rv_fl) end
 
+// TK-GAP(gmem_counter_arrive) begin
+// The megakernel's cross-SM publish (FP8 S8 M0, approved 2026-11-10): add `n` to the u32 counter
+// `c[idx]` in global memory with release order at GPU scope (`red.release.gpu.global.add.u32`), so
+// every write the calling thread ordered before it (the caller's async-proxy fence orders its TMA
+// stores) is visible to a thread whose acquire load sees the sum. TK at the pin has release adds
+// only on its multimem path (`red.release.sys`, multicast memory), none on a plain global counter.
+// One thread calls it.
+template <kittens::ducks::gl::all GL>
+__device__ inline void gmem_counter_arrive(const GL& c, const kittens::coord<>& idx, uint32_t n) {
+    static_assert(std::is_same_v<typename GL::dtype, uint32_t>, "a u32 counter");
+    asm volatile("red.release.gpu.global.add.u32 [%0], %1;\n" ::"l"(&c[idx]), "r"(n) : "memory");
+}
+// TK-GAP(gmem_counter_arrive) end
+
+// TK-GAP(gmem_counter_wait) begin
+// The megakernel's cross-SM wait (FP8 S8 M0, approved 2026-11-10): spin until the u32 counter
+// `c[idx]` is at least `want`, each read an acquire load at GPU scope (`ld.acquire.gpu.global.u32`),
+// the thread sleeping 20 ns between reads (`__nanosleep`, Hazy's `GMEM_SPIN_LOOP_SLEEP_NANOS`), so
+// every write ordered before the releases that made the sum is visible after it returns. `want` is a
+// constant of the instruction list. TK at the pin has no acquire load and no sleep. One thread
+// calls it; a wait whose count is never published never returns (the tests' watchdog fails it).
+template <kittens::ducks::gl::all GL>
+__device__ inline void gmem_counter_wait(const GL& c, const kittens::coord<>& idx, uint32_t want) {
+    static_assert(std::is_same_v<typename GL::dtype, uint32_t>, "a u32 counter");
+    uint32_t seen = 0;
+    for (;;) {
+        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n" : "=r"(seen) : "l"(&c[idx]) : "memory");
+        if (seen >= want) {
+            return;
+        }
+        __nanosleep(20);
+    }
+}
+// TK-GAP(gmem_counter_wait) end
+
 }  // namespace ops
 }  // namespace scratchy

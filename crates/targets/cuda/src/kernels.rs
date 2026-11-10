@@ -669,6 +669,19 @@ unsafe extern "C" {
         swizzled: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_mk_prepare() -> i32;
+    fn scratchy_cuda_mk_test(
+        instructions: *const c_void,
+        n: u32,
+        counters: *mut c_void,
+        counter_count: u32,
+        chain: *mut c_void,
+        chain_count: u32,
+        x: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_tma_box_probe_store(
         pattern: *const c_void,
         dst: *mut c_void,
@@ -997,6 +1010,9 @@ pub enum KernelError {
         kernel: &'static str,
         dims: [u32; 4],
     },
+    /// The megakernel's interpreter (FP8 S8 M0) does not take these counts `[n, counters, chain,
+    /// rows]`, or the device has not 132 SMs; nothing was launched.
+    MkShape { dims: [u32; 4] },
     /// The launcher's C++ host code threw (caught before it could reach Rust).
     HostException,
     /// A `cudaError_t` from the kernel's one-time setup or from its launch.
@@ -1124,6 +1140,10 @@ impl fmt::Display for KernelError {
             KernelError::GateUpShape { kernel, dims } => {
                 write!(f, "{kernel} refused [m, n, k, splits] {dims:?}")
             }
+            KernelError::MkShape { dims } => write!(
+                f,
+                "megakernel refused [n, counters, chain, rows] {dims:?}, or a device not of 132 SMs"
+            ),
             KernelError::HostException => write!(f, "kernel launcher's host code threw"),
             KernelError::Cuda(code) => write!(f, "CUDA error {code}"),
         }
@@ -1231,6 +1251,8 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("moe_sort", scratchy_cuda_moe_sort_prepare),
     ("rope_bf16", scratchy_cuda_rope_bf16_prepare),
     ("rope_append_fp8", scratchy_cuda_rope_append_fp8_prepare),
+    // FP8 S8 M0: the megakernel's interpreter, its 13 pages of dynamic shared memory.
+    ("mk", scratchy_cuda_mk_prepare),
 ];
 
 /// Run every kernel's one-time setup on the current device, stopping at the first failure, which
@@ -2280,6 +2302,66 @@ pub unsafe fn gemv_split_bf16_abt(
     let code =
         unsafe { scratchy_cuda_gemv_split_bf16_abt(a, b, c, partials, n, k, splits, stream) };
     check(code, KernelError::GemvSplit { n, k, splits })
+}
+
+// THE MEGAKERNEL'S INTERPRETER (`kernels/mk_controller.cu`, FP8 S8 M0): test support, for
+// `tests/megakernel.rs` only. No `CudaStep` and no lowering use it yet (M1).
+
+/// The interpreter's workers: 132 SMs × 2 lanes, one instruction list each.
+pub const MK_WORKERS: usize = 132 * 2;
+/// One instruction: 32 `i32` words, word 0 the opcode.
+pub const MK_INSTRUCTION_WIDTH: usize = 32;
+/// A page's `f32` elements (16 KiB), the width of `mk_test`'s `x` and `out` rows.
+pub const MK_PAGE_FLOATS: usize = 4096;
+/// The opcodes `mk_test` plays (`kernels/mk_controller.cu`): nothing; a link of a cross-SM chain;
+/// a row through a lane's page.
+pub const MK_OP_NOOP: i32 = 0;
+pub const MK_OP_CHAIN: i32 = 1;
+pub const MK_OP_PAGE_ECHO: i32 = 2;
+
+/// Test support for `tests/megakernel.rs` only. Play `instructions` (`[MK_WORKERS, n,
+/// MK_INSTRUCTION_WIDTH]` i32) in one cooperative launch of 132 persistent CTAs, over the counters
+/// (`counter_count` u32, zeroed by the caller), `chain` (`chain_count` i32), and `x`, `out`
+/// (`[rows, MK_PAGE_FLOATS]` f32). Refused with [`KernelError::MkShape`] when any count is zero or
+/// `n` / `rows` is above `i32::MAX`, or the device has not 132 SMs. Asynchronous.
+///
+/// # Safety
+///
+/// Every pointer a 16-byte-aligned device pointer to its count of elements, valid for the whole
+/// kernel; `out` overlaps nothing else. Every argument word an instruction reads indexes inside
+/// its buffer, and every count an instruction waits for is published by another instruction of the
+/// list, or the launch never ends. [`prepare_all`] must have succeeded on the current device;
+/// `stream` a live `cudaStream_t` of it, or null for the default stream.
+#[doc(hidden)]
+pub unsafe fn mk_test(
+    (instructions, n): (*const c_void, u32),
+    (counters, counter_count): (*mut c_void, u32),
+    (chain, chain_count): (*mut c_void, u32),
+    (x, out, rows): (*const c_void, *mut c_void, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // counts before it touches a pointer and catches every C++ exception.
+    let code = unsafe {
+        scratchy_cuda_mk_test(
+            instructions,
+            n,
+            counters,
+            counter_count,
+            chain,
+            chain_count,
+            x,
+            out,
+            rows,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::MkShape {
+            dims: [n, counter_count, chain_count, rows],
+        },
+    )
 }
 
 // THE TMA BOX PROBE (`kernels/tma_box_probe.cu`): test support, for `tests/tma_bounds.rs` only.

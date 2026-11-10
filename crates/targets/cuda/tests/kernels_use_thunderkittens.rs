@@ -53,10 +53,13 @@ use std::path::{Path, PathBuf};
 
 /// The inline PTX a kernel may hold, as `(file, PTX string)`: the async-proxy fence after the
 /// prefill's consumers zero a partial V tile, which TK at the pin emits only inside
-/// `warpgroup::mma_fence` and its TMA stores, never on its own.
+/// `warpgroup::mma_fence` and its TMA stores, never on its own; and the megakernel's async-proxy
+/// fence on global memory around its cross-SM counters (FP8 S8 M0, approved 2026-11-10), which TK
+/// at the pin never emits.
 const ASM_ALLOWLIST: &[(&str, &str)] = &[
     ("attn_prefill_bf16.cu", "fence.proxy.async.shared::cta;\n"),
     ("attn_decode_bf16.cu", "fence.proxy.async.shared::cta;\n"),
+    ("mk_controller.cu", "fence.proxy.async.global;\n"),
 ];
 
 /// The op header's gap helpers: operations TK has no map for, written once against TK types.
@@ -65,6 +68,10 @@ const TK_GAPS: &[&str] = &[
     "rv_fma",
     "exclusive_scan_sv",
     "sv_fp8_to_rv_fl",
+    // FP8 S8 M0 (approved 2026-11-10): the megakernel's cross-SM counter, its release add and its
+    // acquire wait.
+    "gmem_counter_arrive",
+    "gmem_counter_wait",
 ];
 
 /// The one extension header, directly under `kernels/`.
