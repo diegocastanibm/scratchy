@@ -1088,3 +1088,173 @@ fn the_w4_fused_end_times_are_recorded() {
         }
     }
 }
+
+// ── FP8 S8 W2c: four e4m3 bytes a lane ─────────────────────────────
+
+/// The element `sv_fp8_to_rv_fl` puts at position `p` of `gemv_fp8_widen_probe`'s output: TK's
+/// naive store writes lane `l`'s slot `w` to `32w + l`, and the widen's slot `w` of lane `l` is
+/// element `32(w − w % 4) + 4l + w % 4`.
+fn widen_element(p: usize) -> usize {
+    let (w, l) = (p / 32, p % 32);
+    32 * (w - w % 4) + 4 * l + w % 4
+}
+
+/// FP8 S8 W2c: the fp8 GEMV's widen, four bytes a lane, gives for every one of the 256 e4m3 bytes
+/// the f32 bits of ThunderKittens' element convertor (cuda_fp8's `__nv_cvt_fp8_to_halfraw`, then
+/// f16 to f32), bit for bit, NaN payloads included (0x7F and 0xFF); each non-NaN value is the
+/// host's exact e4m3 value with its sign (±0 at 0x00 and 0x80), and the 14 subnormals are nonzero.
+#[test]
+fn the_four_byte_widen_is_the_conversion_unit_s_widen_for_every_byte() {
+    use scratchy_target_cuda::kernels::gemv_fp8_widen_probe;
+    let device = h100();
+    let bytes: Vec<u8> = (0..=255u8).collect();
+    let b = DeviceBuffer::upload_bytes(&device, &bytes).expect("upload the bytes");
+    let out = DeviceBuffer::upload_bytes(&device, &[0xA5u8; 512 * 4]).expect("upload out");
+    // SAFETY: cudaMalloc pointers are 256-byte aligned; `b` holds 256 bytes and `out` 512 f32, two
+    // allocations; null is the default stream, which the download below waits for.
+    unsafe { gemv_fp8_widen_probe(b.ptr(), out.ptr(), std::ptr::null_mut()) }
+        .expect("gemv_fp8_widen_probe launch");
+    let got = down_f32(&out);
+    let mut widen = [f32::NAN; 256];
+    for (p, &v) in got[..256].iter().enumerate() {
+        widen[widen_element(p)] = v;
+    }
+    let cvt = &got[256..512];
+    let mut bad = Vec::new();
+    for x in 0..256usize {
+        let (w, c, host) = (widen[x], cvt[x], e4m3_value(x as u8));
+        let exact = host.is_nan() || (f64::from(w) == host && w.is_sign_negative() == (x >= 128));
+        if w.to_bits() != c.to_bits() || !exact {
+            bad.push((x, w.to_bits(), c.to_bits()));
+        }
+    }
+    let subnormals = (1..8).chain(129..136).filter(|&x| widen[x] != 0.0).count();
+    let edges = [0x00usize, 0x80, 0x7F, 0xFF].map(|x| (x, widen[x].to_bits(), cvt[x].to_bits()));
+    let ok = bad.is_empty() && subnormals == 14 && widen[0x7F].is_nan() && widen[0xFF].is_nan();
+    eprintln!(
+        "W2c widen, 256 e4m3 bytes vs __nv_cvt_fp8_to_halfraw: mismatched_bits={} \
+         nonzero_subnormals={subnormals}/14 edges(byte, widen, cvt)={edges:x?} {:x?} {}",
+        bad.len(),
+        &bad[..bad.len().min(8)],
+        verdict(ok)
+    );
+    assert!(
+        ok,
+        "the four-byte widen differs from the conversion unit's on some e4m3 byte"
+    );
+}
+
+/// FP8 S8 W2c's measure-first gate (stop below 2.4 TB/s cold on the gate+up): the 27B's fused
+/// gate+up launch (2 × 17,408 over 5,120, the tape's `GateUpAct`), the same bytes as one GEMV
+/// (34,816 × 5,120), the down (5,120 × 17,408) and the GDN `qkv + z` group (10,240 and 6,144 over
+/// 5,120), cold (L2 cleared) and hot, by CUDA events, as TB/s of the e4m3 weight bytes. Recorded,
+/// not asserted. It calls only launchers and helpers the base has, so the kernel pod copies it into
+/// the base's file and runs it at both SHAs on one GPU.
+#[test]
+fn the_w2c_fp8_gemv_bandwidth_is_recorded() {
+    let device = h100();
+    let scrub = DeviceBuffer::upload_bytes(&device, &vec![0u8; SCRUB_BYTES]).expect("scrub");
+    let line = |what: &str, temp: &str, bytes: usize, (med, lo, hi): (f64, f64, f64)| {
+        eprintln!(
+            "W2c time {temp} {what}: median={med:.1}us min={lo:.1}us max={hi:.1}us {:.2} TB/s",
+            bytes as f64 / med / 1e6
+        );
+    };
+    let (n, k) = (17408u32, 5120u32);
+    let (nu, ku) = (n as usize, k as usize);
+    let x = DeviceBuffer::upload(&device, &bf16_inputs(ku, 0x2C0)).expect("x");
+    let (gq, g_s) = weight(nu, ku, 0x2C1);
+    let (uq, u_s) = weight(nu, ku, 0x2C2);
+    let (gw, uw) = (
+        Fp8Buf::new(&device, &gq, &g_s),
+        Fp8Buf::new(&device, &uq, &u_s),
+    );
+    let c = DeviceBuffer::upload(&device, &vec![0u16; 2 * nu]).expect("c");
+    let splits = gemv_splits(n, k, 1);
+    let p = scratch(
+        &device,
+        2 * gemv_scratch_bytes(n, 1, splits).expect("bytes"),
+    );
+    for (temp, sc) in [("cold", Some(&scrub)), ("hot", None)] {
+        let t = event_times(sc, || {
+            // SAFETY: as `gate_up_gemv_fp8_matches_the_f64_reference`'s.
+            unsafe {
+                gate_up_gemv_fp8(
+                    (x.ptr().cast_const(), gw.op(), uw.op()),
+                    (c.ptr(), p.ptr()),
+                    (n, k, splits),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            }
+            .expect("gate/up launch");
+        });
+        line("27B gate+up fused n=2x17408 k=5120", temp, 2 * nu * ku, t);
+    }
+    for (n, k, what) in [
+        (34816u32, 5120u32, "27B gate+up as one GEMV n=34816 k=5120"),
+        (5120, 17408, "27B down n=5120 k=17408"),
+    ] {
+        let (nu, ku) = (n as usize, k as usize);
+        let x = DeviceBuffer::upload(&device, &bf16_inputs(ku, 0x2C3)).expect("x");
+        let (bq, b_s) = weight(nu, ku, 0x2C4);
+        let w = Fp8Buf::new(&device, &bq, &b_s);
+        let c = DeviceBuffer::upload(&device, &vec![0u16; nu]).expect("c");
+        let splits = gemv_splits(n, k, 1);
+        let p = scratch(&device, gemv_scratch_bytes(n, 1, splits).expect("bytes"));
+        for (temp, sc) in [("cold", Some(&scrub)), ("hot", None)] {
+            let t = event_times(sc, || {
+                // SAFETY: as `run_gemv`'s.
+                unsafe {
+                    gemv_fp8_abt(
+                        (x.ptr().cast_const(), w.op(), c.ptr()),
+                        p.ptr(),
+                        (n, k, splits),
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("launch");
+            });
+            line(what, temp, nu * ku, t);
+        }
+    }
+    let (ns, k) = ([10240u32, 6144], 5120u32);
+    let ku = k as usize;
+    let xb = DeviceBuffer::upload(&device, &bf16_inputs(ku, 0x2C5)).expect("x");
+    let ws: Vec<Fp8Buf> = (ns.iter().enumerate())
+        .map(|(i, &n)| {
+            let (q, s) = weight(n as usize, ku, 0x2C6 ^ i as u64);
+            Fp8Buf::new(&device, &q, &s)
+        })
+        .collect();
+    let splits: Vec<u32> = ns.iter().map(|&n| gemv_splits(n, k, 1)).collect();
+    let outs: Vec<DeviceBuffer> = (ns.iter())
+        .map(|&n| DeviceBuffer::upload(&device, &vec![0u16; n as usize]).expect("c"))
+        .collect();
+    let parts: Vec<DeviceBuffer> = (ns.iter().zip(&splits))
+        .map(|(&n, &s)| scratch(&device, gemv_scratch_bytes(n, 1, s).expect("bytes")))
+        .collect();
+    let members: Vec<(Fp8Operand, *mut c_void, u32)> = (ws.iter().zip(&outs).zip(&ns))
+        .map(|((w, c), &n)| (w.op(), c.ptr(), n))
+        .collect();
+    let pp: Vec<*mut c_void> = (parts.iter().zip(&splits))
+        .map(|(p, &s)| if s > 1 { p.ptr() } else { std::ptr::null_mut() })
+        .collect();
+    let bytes: usize = ns.iter().map(|&n| n as usize * ku).sum();
+    for (temp, sc) in [("cold", Some(&scrub)), ("hot", None)] {
+        let t = event_times(sc, || {
+            // SAFETY: as `gemv_group_fp8_is_each_member_s_own_gemv`'s.
+            unsafe {
+                gemv_group_fp8_abt(
+                    xb.ptr().cast_const(),
+                    &members,
+                    &pp,
+                    (k, &splits),
+                    std::ptr::null_mut(),
+                )
+            }
+            .expect("group launch");
+        });
+        line("27B GDN qkv+z group n=[10240,6144] k=5120", temp, bytes, t);
+    }
+}

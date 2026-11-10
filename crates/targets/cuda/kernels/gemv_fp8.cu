@@ -32,9 +32,11 @@
 //     ring of `sv_fp8e4m3<256>` (256 bytes, one vector TMA per row and chunk, the `k` tail zero),
 //     primed before the prologue so the loads overlap it; it waits once per stage, then per row
 //     widens the chunk with the one gap, `scratchy::ops::sv_fp8_to_rv_fl` (TK has no `rv<fp8>`),
-//     into a naive `rv_fl<256>` in TK's own element order, and adds its products with the chunk
-//     of `q` by the `rv_fma` gap's `fma_acc`. An e4m3 times an e4m3 value is exact in f32, so each
-//     row's sum is its exact products added in ascending K, then `warp::sum`'s fixed tree.
+//     into a naive `rv_fl<256>` four bytes a lane (FP8 S8 W2c: lane `l`'s slot `4v + i` is
+//     element `128v + 4l + i`), and adds its products with the chunk of `q`, loaded in that order
+//     by the gap's `sv_bf_to_rv_fl_fp8_order`, by the `rv_fma` gap's `fma_acc`. An e4m3 times an
+//     e4m3 value is exact in f32, so each row's sum is its exact products, each lane's added in
+//     its slot order chunk by chunk, then `warp::sum`'s fixed tree.
 //   - **The scales**, as S3's epilogue (`gemm_fp8.cu`'s `scale_acc`): lane 0 takes
 //     `(dot · w_scale[row]) · a_scale` (`base_ops::mul`). With one split it rounds to bf16
 //     (`base_types::convertor<bf16, float>`) and stores through `gl::operator[]`. With `S > 1` it
@@ -61,7 +63,8 @@
 //     (`ops/group/register/vec/maps.cuh`); `warp::max`, `warp::sum` (`reductions.cuh`);
 //   - `base_ops::mul`, `base_types::convertor`; `shared_allocator<1024>`, `sv::operator[]`,
 //     `gl::operator[]`;
-//   - the gaps `scratchy::ops::sv_fp8_to_rv_fl` (FP8 S4's, approved 2026-11-06) and `rv_fma`.
+//   - the gaps `scratchy::ops::sv_fp8_to_rv_fl` (FP8 S4's, approved 2026-11-06; its second body
+//     `sv_bf_to_rv_fl_fp8_order`, FP8 S8 W2c, 2026-11-08) and `rv_fma`.
 //
 // Shared memory: the row, 68 vectors of 512 bytes (`k` at most 17,408, the 27B's down projection,
 // the largest fp8 `k` of the three FP8 checkpoints; a longer row is refused), and the weight rings,
@@ -286,14 +289,23 @@ __device__ inline void gemv_dots(const gemv_globals& g, const gemv_smem<ROWS>& s
     if (live) {
         for (int j = 0; j < count; j++) {
             const int s = (j0 + j) % STAGES;
-            warp::load(x, sm.row[c0 + j]);
+            scratchy::ops::sv_bf_to_rv_fl_fp8_order(x, sm.row[c0 + j]);
             wait(sm.arrived[w][s], ((j0 + j) / STAGES) % 2);
+            // A warp of `ROWS` rows (all but a GEMV's last block) runs its rows with no branch
+            // between them, so their loads issue together.
+            const auto dots = [&](auto full) {
 #pragma unroll
-            for (int r = 0; r < ROWS; r++) {
-                if (r < rows) {
-                    scratchy::ops::sv_fp8_to_rv_fl(y, sm.b[w][s][r]);
-                    scratchy::ops::rv_fma<scratchy::ops::fma_acc>(acc[r], y, x, acc[r]);
+                for (int r = 0; r < ROWS; r++) {
+                    if (full || r < rows) {
+                        scratchy::ops::sv_fp8_to_rv_fl(y, sm.b[w][s][r]);
+                        scratchy::ops::rv_fma<scratchy::ops::fma_acc>(acc[r], y, x, acc[r]);
+                    }
                 }
+            };
+            if (rows == ROWS) {
+                dots(std::true_type{});
+            } else {
+                dots(std::false_type{});
             }
             // Every lane has read the stage into registers before its next load overwrites it.
             __syncwarp();
@@ -570,6 +582,38 @@ __global__ __launch_bounds__(NUM_THREADS) void gemv_fp8_quant_probe_ker(
     if (kittens::warpid() == 0 && warp::laneid() == 0) {
         g.scale[{0, 0, 0, split}] = a_scale;
     }
+}
+
+// Test support (`tests/gemv_fp8.rs`, FP8 S8 W2c): `sv_fp8_to_rv_fl`, the GEMV's widen, on one
+// `[1, 256]` e4m3 chunk, stored as f32 to `out[0, :]` by TK's naive `warp::store` (so position
+// `32w + l` holds the widen's slot `w` of lane `l`, element `32(w - w % 4) + 4l + w % 4`); and TK's
+// own element convertor (`convertor<float, fp8e4m3>`, cuda_fp8's `__nv_cvt_fp8_to_halfraw` then f16
+// to f32) to `out[1, :]` in element order, the reference. One warp; no `CudaStep` launches it.
+using widen_gl = gl<fp8e4m3, 1, 1, 1, -1, w_sv>;
+struct widen_globals {
+    widen_gl b;
+    partial_gl out;
+};
+
+__global__ __launch_bounds__(kittens::WARP_THREADS) void gemv_fp8_widen_probe_ker(
+    const __grid_constant__ widen_globals g) {
+    __shared__ sv_fp8e4m3<CHUNK> chunk;
+    __shared__ kittens::semaphore arrived;
+    if (warp::laneid() == 0) {
+        init_semaphore(arrived, 0, 1);
+    }
+    __syncwarp();
+    warp::tma::expect_bytes(arrived, sizeof(w_sv));
+    warp::tma::load_async(chunk, g.b, {0, 0, 0, 0}, arrived);
+    wait(arrived, 0);
+    chunk_rv y;
+    scratchy::ops::sv_fp8_to_rv_fl(y, chunk);
+    warp::store(g.out, y, {0, 0, 0, 0});
+    chunk_rv r;
+    warp::apply(r, r, [&](int i, float) {
+        return base_types::convertor<float, fp8e4m3>::convert(chunk[i]);
+    });
+    warp::store(g.out, r, {0, 0, 1, 0});
 }
 
 // `n` rounded up to the 32-row block.
@@ -1061,6 +1105,28 @@ extern "C" int scratchy_cuda_expert_gate_up_gemv_fp8(
     void* stream /* cudaStream_t; null = default */) {
     return expert_gate_up(a, gate, gate_scale, up, up_scale, topk_idx, c, partials, m, top_k, n,
                           k, experts, expert_rows, splits, act, stream);
+}
+
+// Test support for `tests/gemv_fp8.rs` only (FP8 S8 W2c): the GEMV's widen (`sv_fp8_to_rv_fl`) of
+// the 256 e4m3 bytes `b` into `out[0, 0..256]` f32 in its register order (`gemv_fp8_widen_probe_ker`
+// says which element each position holds), and TK's element convertor of the same bytes into
+// `out[1, 0..256]` in element order, the reference. `b` 16-byte aligned, `out` 512 f32. One warp;
+// asynchronous.
+extern "C" int scratchy_cuda_gemv_fp8_widen_probe(const void* b, void* out,
+                                                  void* stream /* cudaStream_t; null = default */) {
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        widen_gl bg{static_cast<fp8e4m3*>(const_cast<void*>(b)), nullptr, nullptr, nullptr,
+                    size_t(CHUNK)};
+        partial_gl og{static_cast<float*>(out), nullptr, nullptr, size_t(2), size_t(CHUNK)};
+        widen_globals G{bg, og};
+        void* args[] = {&G};
+        const dim3 grid{1u}, block{uint32_t(kittens::WARP_THREADS)};
+        return static_cast<int>(cudaLaunchKernel(gemv_fp8_widen_probe_ker, grid, block, args, 0,
+                                                 static_cast<cudaStream_t>(stream)));
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
 }
 
 // Test support for `tests/gemv_fp8.rs` only: the GEMV's prologue on `a [1, k]` bf16 at `splits`,

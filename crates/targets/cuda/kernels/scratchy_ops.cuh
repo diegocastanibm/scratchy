@@ -470,26 +470,68 @@ __device__ static inline void rv_ternary_map(V& dst, const V& a, const V& b, con
 // `warp::load` of an e4m3 shared vector into a naive f32 register vector (FP8 S4's decode GEMV,
 // approved 2026-11-06): TK at the pin has no `rv<fp8e4m3>` (`types/register/rv.cuh` static_asserts
 // it) and no `move<fp8e4m3>::lds`, so its `load` (`ops/group/memory/vec/shared_to_register.cuh`)
-// does not compile for an fp8 source. The layout is that `load`'s naive one: lane `l`'s slot `w`
-// is element `32w + l`. Slots `w` and `w + 1` widen together, `cvt.rn.f16x2.e4m3x2` on the pair
-// then f16 to f32 (`__nv_cvt_fp8x2_to_halfraw2`, then `__half22float2`, as TK's own fp4 convertor
-// in `common/base_types.cuh` writes it): exact, as every e4m3 value is an f16 and an f32. The low
-// byte is `.x`. One warp, as TK's `load`.
+// does not compile for an fp8 source.
+//
+// FP8 S8 W2c: four bytes a lane a load. Lane `l` reads the 32-bit shared word `8w + l` of each run
+// of four slots `w .. w + 3` (TK's `move<int>::lds`), so its slot `w + i` is element
+// `32w + 4l + i`, not TK's naive `32w + l`: the bytes widen in pairs, `cvt.rn.f16x2.e4m3x2` on each
+// half word, then f16 to f32 (`__nv_cvt_fp8x2_to_halfraw2`, then `__half22float2`, as TK's own fp4
+// convertor in `common/base_types.cuh` writes it), exact, as every e4m3 value is an f16 and an
+// f32, and the conversion unit's own NaN, zeros and subnormals. The low byte is the lower
+// element. No TK layout holds four consecutive elements on one lane (`naive_l` is `32w + l`,
+// `ortho_l` and `align_l` repeat each element on 4 and 8 lanes), so the operand it multiplies is
+// loaded in the same order by `sv_bf_to_rv_fl_fp8_order` below, the gap's second body (the user's
+// 2026-11-08 decision). One warp, as TK's `load`.
 template <kittens::ducks::rv::naive_layout RV, kittens::ducks::sv::all SV>
 __device__ static inline void sv_fp8_to_rv_fl(RV& dst, const SV& src) {
     static_assert(std::is_same_v<typename SV::dtype, kittens::fp8e4m3>, "an e4m3 shared vector");
     static_assert(std::is_same_v<typename RV::dtype, float>, "a naive f32 register vector");
-    static_assert(SV::length == RV::length && RV::length % 64 == 0, "whole pairs of 32-wide slots");
+    static_assert(SV::length == RV::length && RV::length % 128 == 0, "whole words of 4 slots");
     const int lane = kittens::laneid();
+    const uint32_t base = static_cast<uint32_t>(__cvta_generic_to_shared(&src.data[0]));
     __syncwarp();
 #pragma unroll
-    for (int w = 0; w < RV::outer_dim; w += 2) {
-        const __nv_fp8x2_storage_t lo = src[32 * w + lane].__x;
-        const __nv_fp8x2_storage_t hi = src[32 * (w + 1) + lane].__x;
-        const __nv_fp8x2_storage_t pair = __nv_fp8x2_storage_t(lo | (hi << 8));
-        const float2 f = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(pair, __NV_E4M3)));
-        dst[w][0] = f.x;
-        dst[w + 1][0] = f.y;
+    for (int w = 0; w < RV::outer_dim; w += 4) {
+        int word;
+        kittens::move<int>::lds(word, base + uint32_t(32 * w + 4 * lane));
+        const uint32_t u = uint32_t(word);
+        const float2 lo = __half22float2(
+            __half2(__nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(u & 0xFFFFu), __NV_E4M3)));
+        const float2 hi = __half22float2(
+            __half2(__nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(u >> 16), __NV_E4M3)));
+        dst[w][0] = lo.x;
+        dst[w + 1][0] = lo.y;
+        dst[w + 2][0] = hi.x;
+        dst[w + 3][0] = hi.y;
+    }
+}
+
+// The bf16 operand of `sv_fp8_to_rv_fl`'s products, in its order: TK's `warp::load` of a bf16
+// shared vector into a naive f32 register vector, lane `l`'s slot `w + i` (`w` a multiple of 4)
+// element `32w + 4l + i`. Each lane reads its four elements as two `bf16_2` (TK's
+// `move<bf16_2>::lds`) and widens them by TK's `convertor<float2, bf16_2>`, exact. One warp.
+template <kittens::ducks::rv::naive_layout RV, kittens::ducks::sv::all SV>
+__device__ static inline void sv_bf_to_rv_fl_fp8_order(RV& dst, const SV& src) {
+    static_assert(std::is_same_v<typename SV::dtype, kittens::bf16>, "a bf16 shared vector");
+    static_assert(std::is_same_v<typename RV::dtype, float>, "a naive f32 register vector");
+    static_assert(SV::length == RV::length && RV::length % 128 == 0, "whole words of 4 slots");
+    using kittens::bf16_2;
+    using kittens::base_types::convertor;
+    const int lane = kittens::laneid();
+    const uint32_t base = static_cast<uint32_t>(__cvta_generic_to_shared(&src.data[0]));
+    __syncwarp();
+#pragma unroll
+    for (int w = 0; w < RV::outer_dim; w += 4) {
+        bf16_2 a, b;
+        const uint32_t at = base + uint32_t(2 * (32 * w + 4 * lane));
+        kittens::move<bf16_2>::lds(a, at);
+        kittens::move<bf16_2>::lds(b, at + 4);
+        const float2 lo = convertor<float2, bf16_2>::convert(a);
+        const float2 hi = convertor<float2, bf16_2>::convert(b);
+        dst[w][0] = lo.x;
+        dst[w + 1][0] = lo.y;
+        dst[w + 2][0] = hi.x;
+        dst[w + 3][0] = hi.y;
     }
 }
 // TK-GAP(sv_fp8_to_rv_fl) end

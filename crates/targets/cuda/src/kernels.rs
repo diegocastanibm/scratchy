@@ -235,6 +235,11 @@ unsafe extern "C" {
         act: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gemv_fp8_widen_probe(
+        b: *const c_void,
+        out: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gemv_fp8_quant_probe(
         a: *const c_void,
         out: *mut c_void,
@@ -3891,6 +3896,29 @@ pub unsafe fn expert_gate_up_gemv_fp8(
             dims: [m.saturating_mul(top_k), n, k, splits],
         },
     )
+}
+
+/// Test support for `tests/gemv_fp8.rs` only (FP8 S8 W2c): the fp8 GEMV's widen
+/// (`scratchy_ops.cuh`'s `sv_fp8_to_rv_fl`, four bytes a lane) of the 256 e4m3 bytes `b` into
+/// `out[0..256]` f32 in its register order, position `32w + l` holding element
+/// `32(w − w % 4) + 4l + w % 4`, and ThunderKittens' element convertor (cuda_fp8's
+/// `__nv_cvt_fp8_to_halfraw`, then f16 to f32) of the same bytes into `out[256..512]` in element
+/// order, the reference. No `CudaStep` uses it. Asynchronous.
+///
+/// # Safety
+///
+/// `b` must be a 16-byte-aligned device pointer to 256 bytes and `out` to 512 f32, valid for the
+/// whole kernel, `out` overlapping `b` nowhere. `stream` as [`gemv_fp8_abt`]'s.
+#[doc(hidden)]
+pub unsafe fn gemv_fp8_widen_probe(
+    b: *const c_void,
+    out: *mut c_void,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher catches every
+    // C++ exception.
+    let code = unsafe { scratchy_cuda_gemv_fp8_widen_probe(b, out, stream) };
+    check(code, KernelError::HostException)
 }
 
 /// Test support for `tests/gemv_fp8.rs` only: the fp8 GEMV's prologue on `a [1, k]` bf16 at
