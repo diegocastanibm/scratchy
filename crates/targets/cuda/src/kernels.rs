@@ -679,6 +679,14 @@ unsafe extern "C" {
         swizzled: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_tma_ring_probe(
+        b: *const c_void,
+        out: *mut c_void,
+        n: u32,
+        k: u32,
+        variant: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_attn_decode_bf16_prepare() -> i32;
     fn scratchy_cuda_attn_decode_bf16(
         q: *const c_void,
@@ -2362,6 +2370,38 @@ pub unsafe fn tma_box_probe_store(
         )
     };
     check(code, KernelError::RowShape { rows, cols })
+}
+
+// THE TMA RING PROBE (`kernels/tma_ring_probe.cu`): test support, for
+// `tests/gemv_fp8_ring_probe.rs` only (FP8 S8 W2c). No `CudaStep` and no lowering use it. It
+// streams an e4m3 weight through the fp8 GEMV's grid and rings with no dot product, at five sizes
+// of TMA operation, to tell whether that GEMV is bound by its TMA operation rate. It sets its own
+// shared-memory attribute per call, so it is not in `PREPARE`.
+
+/// Test support for `tests/gemv_fp8_ring_probe.rs` only. Stream `b` (`[n, k]` e4m3) through the
+/// ring probe's variant `variant` (0: 256-byte vectors at 3 rows a warp; 1: 256-byte vectors;
+/// 2: 512-byte 2-row tiles; 3: 4 KB 16-row tiles per 4 warps; 4: 16 KB 16 × 1,024 tiles per 4
+/// warps) and store each thread's fold of the bytes it read into `out`. Refused with
+/// [`KernelError::RowShape`] (`rows` `n`, `cols` `k`) unless `n` and `k` are non-zero and at most
+/// `i32::MAX / 2`, `variant` at most 4, `k` a multiple of 256 (1,024 for variant 4) and, for
+/// variants 2 to 4, `n` a multiple of 32. Asynchronous.
+///
+/// # Safety
+///
+/// `b` must be a 16-byte-aligned device pointer to `n · k` bytes and `out` to `16 · n + 256` f32,
+/// valid for the whole kernel, not overlapping. `stream` must be a live `cudaStream_t` of the
+/// current device, or null for the default stream.
+#[doc(hidden)]
+pub unsafe fn tma_ring_probe(
+    (b, out): (*const c_void, *mut c_void),
+    (n, k): (u32, u32),
+    variant: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer and catches every C++ exception.
+    let code = unsafe { scratchy_cuda_tma_ring_probe(b, out, n, k, variant, stream) };
+    check(code, KernelError::RowShape { rows: n, cols: k })
 }
 
 /// Launch the GQA decode attention of one query row `q` (`[1, q_heads · 256]`) over one layer's
