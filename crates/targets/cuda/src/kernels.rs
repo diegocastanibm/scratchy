@@ -687,6 +687,24 @@ unsafe extern "C" {
         variant: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_tma_consume_probe(
+        b: *const c_void,
+        a: *const c_void,
+        out: *mut c_void,
+        n: u32,
+        k: u32,
+        consume: u32,
+        rows: u32,
+        ctas: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_tma_probe_occupancy(
+        variant: u32,
+        consume: u32,
+        rows: u32,
+        ctas: u32,
+        blocks: *mut i32,
+    ) -> i32;
     fn scratchy_cuda_attn_decode_bf16_prepare() -> i32;
     fn scratchy_cuda_attn_decode_bf16(
         q: *const c_void,
@@ -2402,6 +2420,50 @@ pub unsafe fn tma_ring_probe(
     // shape before it touches a pointer and catches every C++ exception.
     let code = unsafe { scratchy_cuda_tma_ring_probe(b, out, n, k, variant, stream) };
     check(code, KernelError::RowShape { rows: n, cols: k })
+}
+
+/// Test support for `tests/gemv_fp8_ring_probe.rs` only (FP8 S8 W2d). Stream `b` (`[n, k]` e4m3)
+/// through the consume probe's variant `consume` (0 wait, 1 every byte, 2 the widen, 3 the dot
+/// with the activation row `a` (`[1, k]` bf16), 4 the dot with the GEMV's quantizing prologue) at
+/// `rows` (3 or 4) rows a warp and exactly `ctas` (2 or 3) CTAs per SM, and store each thread's
+/// fold into `out` (int). Refused with [`KernelError::RowShape`] (`rows` `n`, `cols` `k`) unless
+/// `n` is non-zero and at most `i32::MAX / 2`, `k` a non-zero multiple of 256 at most 17,408 (at
+/// most 8,192 for variants 3 and 4 at 3 CTAs), and `consume`, `rows` and `ctas` in range.
+/// Asynchronous.
+///
+/// # Safety
+///
+/// `b` must be a 16-byte-aligned device pointer to `n · k` bytes, `a` to `k` bf16 and `out` to
+/// `11 · n + 256` i32, valid for the whole kernel, `out` overlapping neither input. `stream` as
+/// [`tma_ring_probe`]'s.
+#[doc(hidden)]
+pub unsafe fn tma_consume_probe(
+    (b, a, out): (*const c_void, *const c_void, *mut c_void),
+    (n, k): (u32, u32),
+    (consume, rows, ctas): (u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer and catches every C++ exception.
+    let code =
+        unsafe { scratchy_cuda_tma_consume_probe(b, a, out, n, k, consume, rows, ctas, stream) };
+    check(code, KernelError::RowShape { rows: n, cols: k })
+}
+
+/// Test support for `tests/gemv_fp8_ring_probe.rs` only: the CTAs per SM the CUDA runtime gives a
+/// probe instance on the current device: ring variant `variant` when `consume` is `None`, else
+/// consume variant `(consume, rows, ctas)` as [`tma_consume_probe`] takes it. It sets the
+/// instance's shared-memory attribute, so call it outside a capture.
+#[doc(hidden)]
+pub fn tma_probe_occupancy(
+    variant: u32,
+    consume: Option<(u32, u32, u32)>,
+) -> Result<i32, KernelError> {
+    let (c, rows, ctas) = consume.unwrap_or((5, 4, 2));
+    let mut blocks = 0i32;
+    // SAFETY: `blocks` is a live local the call writes once; no device pointer is passed.
+    let code = unsafe { scratchy_cuda_tma_probe_occupancy(variant, c, rows, ctas, &mut blocks) };
+    check(code, KernelError::RowShape { rows, cols: ctas }).map(|()| blocks)
 }
 
 /// Launch the GQA decode attention of one query row `q` (`[1, q_heads · 256]`) over one layer's
