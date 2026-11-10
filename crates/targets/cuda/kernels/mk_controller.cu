@@ -171,51 +171,72 @@ __device__ inline void op_page_echo(const mk_globals& g, const instruction_sv& i
     __syncwarp();
 }
 
-// Lane `LANE`'s consumers: instruction `i` from stage `i % 2`, dispatched by its opcode.
-template <int LANE>
-__device__ inline void consume(const mk_globals& g, instruction_sv (&ring)[STAGES],
-                               semaphore (&arrived)[STAGES], semaphore (&finished)[STAGES],
-                               semaphore& echoed) {
-    const int lw = kittens::warpid() % LANE_WARPS;
-    int echoes = 0;
-    for (int i = 0; i < g.n; i++) {
-        const int s = i % STAGES;
-        wait(arrived[s], (i / STAGES) % 2);
-        const instruction_sv& ins = ring[s];
-        const int op = ins[0];
-        if (lw == 0 && op != OP_NOOP) {
-            if (op == OP_CHAIN) {
-                op_chain(g, ins);
-            } else if (op == OP_PAGE_ECHO) {
-                op_page_echo<LANE>(g, ins, echoed, echoes);
-            }
-        }
-        echoes += op == OP_PAGE_ECHO ? 1 : 0;
-        // Every warp of the lane is done with the stage before the controller refills it.
-        group<LANE_WARPS>::sync(LANE_BARRIER + LANE);
-        if (warp::laneid() == 0) {
-            arrive(finished[s]);
-        }
-    }
-}
+// THE INTERPRETER, shared by every program (`mk_test_ker`, and M0's `mk_mlp_ker`).
 
-// Lane `LANE`'s controller: instruction `i` of its worker into stage `i % 2`, once the stage's
-// last instruction is done.
-template <int LANE>
-__device__ inline void control(const mk_globals& g, instruction_sv (&ring)[STAGES],
-                               semaphore (&arrived)[STAGES], semaphore (&finished)[STAGES]) {
-    const int worker = LANES * int(blockIdx.x) + LANE;
-    for (int i = 0; i < g.n; i++) {
+// One lane's instruction ring: its stages and their semaphores (`arrived`: the stage holds its
+// instruction; `finished`: the lane's warps are done with it).
+struct ring_state {
+    instruction_sv (&stage)[STAGES];
+    semaphore (&arrived)[STAGES];
+    semaphore (&finished)[STAGES];
+};
+
+// A lane's controller warp: instruction `i` of row `worker` of `instructions` into stage `i % 2`,
+// once the stage's instruction `i − 2` is done. `n` is the launch's list length, every worker's.
+__device__ inline void control(const instruction_gl& instructions, int n, int worker,
+                               const ring_state& r) {
+    for (int i = 0; i < n; i++) {
         const int s = i % STAGES;
         if (i >= STAGES) {
-            wait(finished[s], (i / STAGES - 1) % 2);
+            wait(r.finished[s], (i / STAGES - 1) % 2);
         }
-        warp::tma::expect_bytes(arrived[s], uint32_t(sizeof(instruction_sv)));
-        warp::tma::load_async(ring[s], g.instructions, {0, worker, i, 0}, arrived[s]);
+        warp::tma::expect_bytes(r.arrived[s], uint32_t(sizeof(instruction_sv)));
+        warp::tma::load_async(r.stage[s], instructions, {0, worker, i, 0}, r.arrived[s]);
     }
 }
 
-__global__ __launch_bounds__(NUM_THREADS, 1) void mk_ker(const __grid_constant__ mk_globals g) {
+// A lane's `LANE_W` consumer warps: instruction `i` from stage `i % 2`, `run` on it by every warp
+// of the lane; then, once every warp is done (the lane's named barrier `barrier`), `done` on it by
+// every warp (a publish runs there, after every store of the instruction), and the stage handed back.
+template <int LANE_W, typename RUN, typename DONE>
+__device__ inline void play(int n, const ring_state& r, int barrier, RUN&& run, DONE&& done) {
+    for (int i = 0; i < n; i++) {
+        const int s = i % STAGES;
+        wait(r.arrived[s], (i / STAGES) % 2);
+        run(r.stage[s]);
+        // Every warp of the lane is done with the stage (and its stores) before `done`.
+        group<LANE_W>::sync(barrier);
+        done(r.stage[s]);
+        if (warp::laneid() == 0) {
+            arrive(r.finished[s]);
+        }
+    }
+}
+
+// THE INTERPRETER'S OWN TEST PROGRAM (M0 Day 1): two lanes per SM, `OP_CHAIN` and `OP_PAGE_ECHO`.
+
+// Lane `LANE`'s consumers.
+template <int LANE>
+__device__ inline void consume(const mk_globals& g, const ring_state& r, semaphore& echoed) {
+    const int lw = kittens::warpid() % LANE_WARPS;
+    int echoes = 0;
+    play<LANE_WARPS>(
+        g.n, r, LANE_BARRIER + LANE,
+        [&](const instruction_sv& ins) {
+            const int op = ins[0];
+            if (lw == 0 && op != OP_NOOP) {
+                if (op == OP_CHAIN) {
+                    op_chain(g, ins);
+                } else if (op == OP_PAGE_ECHO) {
+                    op_page_echo<LANE>(g, ins, echoed, echoes);
+                }
+            }
+            echoes += op == OP_PAGE_ECHO ? 1 : 0;
+        },
+        [](const instruction_sv&) {});
+}
+
+__global__ __launch_bounds__(NUM_THREADS, 1) void mk_test_ker(const __grid_constant__ mk_globals g) {
     __shared__ sv<int, INSTRUCTION_WIDTH> ring0[STAGES];
     __shared__ sv<int, INSTRUCTION_WIDTH> ring1[STAGES];
     __shared__ semaphore arrived0[STAGES], finished0[STAGES], arrived1[STAGES], finished1[STAGES];
@@ -233,14 +254,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void mk_ker(const __grid_constant__
     }
     // Every semaphore is initialised before any thread waits on it or a TMA arrives on it.
     __syncthreads();
+    const ring_state r0{ring0, arrived0, finished0}, r1{ring1, arrived1, finished1};
     if (w < LANE_WARPS) {
-        consume<0>(g, ring0, arrived0, finished0, echoed0);
+        consume<0>(g, r0, echoed0);
     } else if (w < CONSUMER_WARPS) {
-        consume<1>(g, ring1, arrived1, finished1, echoed1);
+        consume<1>(g, r1, echoed1);
     } else if (w == CONTROLLER_WARP) {
-        control<0>(g, ring0, arrived0, finished0);
+        control(g.instructions, g.n, LANES * int(blockIdx.x), r0);
     } else if (w == CONTROLLER_WARP + 1) {
-        control<1>(g, ring1, arrived1, finished1);
+        control(g.instructions, g.n, LANES * int(blockIdx.x) + 1, r1);
     }
     // No warp leaves while another may still arrive on a semaphore it waits on.
     __syncthreads();
@@ -263,7 +285,7 @@ struct mk_args {
 // 0 = done; any other value = the cudaError_t of setting the attribute.
 extern "C" int scratchy_cuda_mk_prepare(void) {
     return static_cast<int>(
-        cudaFuncSetAttribute(mk_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, MK_SMEM_BYTES));
+        cudaFuncSetAttribute(mk_test_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, MK_SMEM_BYTES));
 }
 
 // Test support (`tests/megakernel.rs`), M0 Day 1: play `instructions [SMS · LANES, n, 32]` int,
@@ -307,7 +329,7 @@ extern "C" int scratchy_cuda_mk_test(const void* instructions, uint32_t n, void*
         mk_globals G{ig, cg, chg, xg, og, int(n)};
         void* args[] = {&G};
         const dim3 grid{uint32_t(SMS)}, block{uint32_t(NUM_THREADS)};
-        return static_cast<int>(cudaLaunchCooperativeKernel(mk_ker, grid, block, args,
+        return static_cast<int>(cudaLaunchCooperativeKernel(mk_test_ker, grid, block, args,
                                                             MK_SMEM_BYTES,
                                                             static_cast<cudaStream_t>(stream)));
     } catch (...) {
