@@ -300,20 +300,51 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void mk_test_ker(const __grid_const
 constexpr int OP_GATE_UP = 3;
 constexpr int OP_DOWN = 4;
 
+// M0-A (the ablation, test support only; `V = 0` is the program above, unchanged): each flag
+// removes one suspected cost, so its time can be measured. Only `V = 0` and `FULL_WAVE` alone keep
+// the bits.
+//   - `NORM_ONCE`: the gate/up reads the layer's normed row `nrow[layer]` (computed by the host's
+//     launch of today's norm) instead of norming `h[layer]` itself.
+//   - `QUANT_ONCE`: both opcodes read a pre-quantized row (`qrow[layer]` / `qact[layer]`, e4m3 values
+//     as bf16, and their scales `qscale`) instead of running `quantize_row`. Implies `NORM_ONCE`
+//     for the gate/up.
+//   - `NO_WAIT`: no counter wait (the lists name none, the data is already there).
+//   - `FULL_WAVE`: the gate/up at 2 rows a warp (132 blocks of 16 rows) instead of 4 (66 of 32).
+//   - `TWO_LANES`: two lanes of 8 consumer warps per SM (264 workers), with `NORM_ONCE` and
+//     `QUANT_ONCE` (no norm tile: the registers fit).
+constexpr int NORM_ONCE = 1;
+constexpr int QUANT_ONCE = 2;
+constexpr int NO_WAIT = 4;
+constexpr int FULL_WAVE = 8;
+constexpr int TWO_LANES = 16;
+// A trace record: 8 `clock64` stamps per instruction (`T_*`), `[workers, n, 8]` u64, when the
+// launcher is given a trace buffer.
+constexpr int T_START = 0;
+constexpr int T_PRIMED = 1;
+constexpr int T_WAITED = 2;
+constexpr int T_NORMED = 3;
+constexpr int T_QUANTIZED = 4;
+constexpr int T_DOTS = 5;
+constexpr int T_STORED = 6;
+constexpr int T_ARRIVED = 7;
+constexpr int TRACE_WIDTH = 8;
+
 // Gemma 4 26B-A4B's dense MLP: hidden 2,816 (11 norm tiles of 256), intermediate 2,112.
 constexpr int HIDDEN = 2816;
 constexpr int INTER = 2112;
 constexpr int NORM_TILES = HIDDEN / 256;
 constexpr int MLP_WARPS = LANE_WARPS + 1;
-constexpr int MLP_THREADS = MLP_WARPS * kittens::WARP_THREADS;
 // `gemv_fp8.cu`'s geometry: 8 warps of 4 rows (gate/up), of 2 rows (the down at 176 blocks).
 constexpr int GEMV_CHUNK = 256;
 constexpr int GEMV_STAGES = 4;
 constexpr int GU_ROWS = 4;
+constexpr int GU_ROWS_FULL = 2;
 constexpr int DOWN_ROWS = 2;
 constexpr int GU_BLOCKS = (INTER + LANE_WARPS * GU_ROWS - 1) / (LANE_WARPS * GU_ROWS);
 constexpr int DOWN_BLOCKS = (HIDDEN + LANE_WARPS * DOWN_ROWS - 1) / (LANE_WARPS * DOWN_ROWS);
-static_assert(GU_BLOCKS == 66 && DOWN_BLOCKS == 176, "today's grids at these shapes");
+constexpr int GU_BLOCKS_FULL = (INTER + LANE_WARPS * GU_ROWS_FULL - 1) / (LANE_WARPS * GU_ROWS_FULL);
+static_assert(GU_BLOCKS == 66 && DOWN_BLOCKS == 176 && GU_BLOCKS_FULL == 132,
+              "today's grids at these shapes, and the full wave's");
 // The rows' chunks: the norm's output (11 of 256) and the down's input (2,112 / 256 = 8.25: 9).
 constexpr int ROW_CHUNKS = 11;
 constexpr int GU_CHUNKS = HIDDEN / GEMV_CHUNK;
@@ -337,6 +368,8 @@ using act_gl = gl<bf16, 1, -1, 1, INTER, row_sv>;
 using weight_gl = gl<fp8e4m3, 1, -1, -1, -1, w_sv>;
 using scale_gl = gl<float, 1, 1, -1, -1>;
 using out_gl = gl<bf16, 1, -1, 1, HIDDEN>;
+using trace_gl = gl<uint64_t, 1, -1, -1, TRACE_WIDTH>;
+using qscale_gl = gl<float, 1, 1, -1, 2>;
 
 struct mlp_globals {
     instruction_gl instructions;
@@ -353,6 +386,14 @@ struct mlp_globals {
     scale_gl up_scale;
     scale_gl down_scale;
     act_gl act;
+    // M0-A only: the precomputed rows (`NORM_ONCE`: `nrow`; `QUANT_ONCE`: `qrow`, `qact` and the
+    // scales `qscale[layer] = {gate/up's, down's}`) and the trace (`trace_on` zero: none).
+    x_gl nrow;
+    x_gl qrow;
+    act_gl qact;
+    qscale_gl qscale;
+    trace_gl trace;
+    int trace_on;
     float eps;
     float gain_offset;
     int n;
@@ -367,8 +408,41 @@ struct mlp_smem {
     sums_sv (&sums)[4];
     row_sv (&row)[ROW_CHUNKS];
     row_sv (&act)[DOWN_CHUNKS];
+    // M0-A: a precomputed row, TMA-written only.
+    row_sv (&pre)[ROW_CHUNKS];
     w_sv (&b)[LANE_WARPS][GEMV_STAGES][GU_ROWS];
 };
+
+// The norm-free form's lane buffers (`TWO_LANES`): its two rows and its weight ring, lane `LANE`'s
+// past lane 0's.
+struct lane_smem {
+    row_sv (&row)[ROW_CHUNKS];
+    row_sv (&act)[DOWN_CHUNKS];
+    // M0-A: a precomputed row, TMA-written only.
+    row_sv (&pre)[ROW_CHUNKS];
+    w_sv (&b)[LANE_WARPS][GEMV_STAGES][GU_ROWS];
+};
+
+template <int LANE>
+__device__ inline lane_smem lane_pages() {
+    extern __shared__ int __shm[];
+    shared_allocator<1024> al((int*)&__shm[0]);
+    if constexpr (LANE > 0) {
+        al.allocate<row_sv, ROW_CHUNKS>();
+        al.allocate<row_sv, DOWN_CHUNKS>();
+        al.allocate<row_sv, ROW_CHUNKS>();
+        al.allocate<w_sv, LANE_WARPS, GEMV_STAGES, GU_ROWS>();
+    }
+    row_sv(&row)[ROW_CHUNKS] = al.allocate<row_sv, ROW_CHUNKS>();
+    row_sv(&act)[DOWN_CHUNKS] = al.allocate<row_sv, DOWN_CHUNKS>();
+    row_sv(&pre)[ROW_CHUNKS] = al.allocate<row_sv, ROW_CHUNKS>();
+    w_sv(&b)[LANE_WARPS][GEMV_STAGES][GU_ROWS] = al.allocate<w_sv, LANE_WARPS, GEMV_STAGES, GU_ROWS>();
+    return lane_smem{row, act, pre, b};
+}
+static_assert(2 * ((2 * ROW_CHUNKS + DOWN_CHUNKS) * sizeof(row_sv) +
+                   LANE_WARPS * GEMV_STAGES * GU_ROWS * sizeof(w_sv) + 4 * 1024) <=
+                  size_t(MK_SMEM_BYTES),
+              "two lanes' rows and rings fit the pages");
 
 __device__ inline mlp_smem mlp_pages() {
     extern __shared__ int __shm[];
@@ -379,13 +453,14 @@ __device__ inline mlp_smem mlp_pages() {
     sums_sv(&sums)[4] = al.allocate<sums_sv, 4>();
     row_sv(&row)[ROW_CHUNKS] = al.allocate<row_sv, ROW_CHUNKS>();
     row_sv(&act)[DOWN_CHUNKS] = al.allocate<row_sv, DOWN_CHUNKS>();
+    row_sv(&pre)[ROW_CHUNKS] = al.allocate<row_sv, ROW_CHUNKS>();
     w_sv(&b)[LANE_WARPS][GEMV_STAGES][GU_ROWS] = al.allocate<w_sv, LANE_WARPS, GEMV_STAGES, GU_ROWS>();
-    return mlp_smem{tiles, owned, gain, sums, row, act, b};
+    return mlp_smem{tiles, owned, gain, sums, row, act, pre, b};
 }
 // 10 norm tiles of 8 KiB, the gain and sums, the two rows and the ring of 8 × 4 × 4 × 256 B, each
 // allocation aligned to 1,024 bytes: inside the 13 pages.
-static_assert(10 * sizeof(norm_tile) + (ROW_CHUNKS + DOWN_CHUNKS) * sizeof(row_sv) +
-                      LANE_WARPS * GEMV_STAGES * GU_ROWS * sizeof(w_sv) + 7 * 1024 <=
+static_assert(10 * sizeof(norm_tile) + (2 * ROW_CHUNKS + DOWN_CHUNKS) * sizeof(row_sv) +
+                      LANE_WARPS * GEMV_STAGES * GU_ROWS * sizeof(w_sv) + 8 * 1024 <=
                   size_t(MK_SMEM_BYTES),
               "the lane's buffers fit the pages");
 
@@ -398,8 +473,10 @@ struct mlp_sems {
     sums_sv& amax;
 };
 
-// The lane's 8 consumer warps sync on named barrier 1 (288 threads would include the controller).
-__device__ inline void lane_sync() { group<LANE_WARPS>::sync(LANE_BARRIER); }
+// The lane's 8 consumer warps sync on their named barrier: 1 (288 threads would include the
+// controller), lane 1's 2 under `TWO_LANES`. A lane's warps are `8L .. 8L + 7`.
+__device__ inline int lane_of() { return kittens::warpid() / LANE_WARPS; }
+__device__ inline void lane_sync() { group<LANE_WARPS>::sync(LANE_BARRIER + lane_of()); }
 
 // `rms_norm_one_row_ker<NORM>`'s pass 1 on `x[layer]` by warps 0..3 (the other four idle at the
 // barriers), then each warp's `inv`; then its pass 2 for every tile `t`, by warp `t % 4` (that
@@ -481,10 +558,10 @@ __device__ inline void norm_row(const mlp_globals& g, const mlp_smem& sm, const 
 // `gemv_fp8.cu`'s `quantize_row` of `src`'s `chunks` (one split) into the lane's row: its amax by
 // the 8 warps (`warp::abs`, `warp::max`, the 16-slot vector), its scale, then each chunk quantized
 // (`src` may be the row itself). Every warp calls it; returns the scale.
-template <int N>
-__device__ inline float quantize_row(const row_sv (&src)[N], const mlp_smem& sm,
-                                     const mlp_sems& se, int chunks) {
-    const int w = kittens::warpid();
+template <int N, typename SM>
+__device__ inline float quantize_row(const row_sv (&src)[N], const SM& sm, const mlp_sems& se,
+                                     int chunks) {
+    const int w = kittens::warpid() % LANE_WARPS;
     chunk_rv x, m;
     warp::zero(m);
     for (int c = w; c < chunks; c += LANE_WARPS) {
@@ -513,14 +590,14 @@ __device__ inline float quantize_row(const row_sv (&src)[N], const mlp_smem& sm,
 }
 
 // `gemv_fp8.cu`'s `gemv_dots` for one warp's `ROWS` rows from `row0` of weight `b` (`depth` the
-// layer) over the row's `chunks`, the ring continuing at load `j0`; `ring_uses` counts the warp's
-// loads into each stage so far (the phase). `before` runs after the ring is primed. Returns each
-// row's unscaled sum in every lane, rows past `n` +0.
-template <int ROWS, typename BEFORE>
-__device__ inline void dots(const weight_gl& b, const mlp_smem& sm, const mlp_sems& se, int depth,
-                            int row0, int n, int chunks, int j0, BEFORE&& before,
-                            float (&dot)[ROWS]) {
-    const int w = kittens::warpid();
+// layer) over `xrow`'s `chunks` (the quantized row), the ring continuing at load `j0` (the warp's
+// loads so far, the stages' phase). `before` runs after the ring is primed, and fills `xrow`.
+// Returns each row's unscaled sum in every lane, rows past `n` +0.
+template <int ROWS, typename SM, int N, typename BEFORE>
+__device__ inline void dots(const weight_gl& b, const SM& sm, const mlp_sems& se, int depth,
+                            int row0, int n, const row_sv (&xrow)[N], int chunks, int j0,
+                            BEFORE&& before, float (&dot)[ROWS]) {
+    const int w = kittens::warpid() % LANE_WARPS;
     const int rows = max(0, min(ROWS, n - row0));
     const bool live = rows > 0;
     const auto issue = [&](int j) {
@@ -548,7 +625,7 @@ __device__ inline void dots(const weight_gl& b, const mlp_smem& sm, const mlp_se
     if (live) {
         for (int j = 0; j < chunks; j++) {
             const int s = (j0 + j) % GEMV_STAGES;
-            warp::load(x, sm.row[j]);
+            warp::load(x, xrow[j]);
             wait(se.ring[w][s], ((j0 + j) / GEMV_STAGES) % 2);
 #pragma unroll
             for (int r = 0; r < ROWS; r++) {
@@ -579,7 +656,7 @@ __device__ inline float scaled(const scale_gl& s, int depth, int row, float dot,
 // the stores the counted publishes ordered. Every consumer warp calls it.
 __device__ inline void lane_await(const mlp_globals& g, const instruction_sv& ins) {
     if (ins[4] > 0) {
-        if (kittens::warpid() == 0 && warp::laneid() == 0) {
+        if (kittens::warpid() % LANE_WARPS == 0 && warp::laneid() == 0) {
             scratchy::ops::gmem_counter_wait(g.counters, {0, 0, 0, ins[3]}, uint32_t(ins[4]));
         }
         lane_sync();
@@ -587,36 +664,97 @@ __device__ inline void lane_await(const mlp_globals& g, const instruction_sv& in
     }
 }
 
-// The lane's 8 consumer warps.
-__device__ inline void mlp_consume(const mlp_globals& g, const ring_state& r, const mlp_sems& se) {
-    const mlp_smem sm = mlp_pages();
-    const int w = kittens::warpid();
+// M0-A's trace: stamp `k` of instruction `i` of `worker` (its SM's `clock64`), by the lane's warp
+// 0 lane 0. `trace_sync` ends a phase on every warp of the lane first; both are nothing when the
+// launch has no trace, so an untraced play is the program's own timing.
+__device__ inline void stamp(const mlp_globals& g, int worker, int i, int k) {
+    if (g.trace_on && kittens::warpid() % LANE_WARPS == 0 && warp::laneid() == 0) {
+        g.trace[{0, worker, i, k}] = uint64_t(clock64());
+    }
+}
+__device__ inline void trace_sync(const mlp_globals& g) {
+    if (g.trace_on) {
+        lane_sync();
+    }
+}
+
+// The row `src[layer]`'s `chunks` TMA-loaded into `dst` by the lane's warp 0, on `sem` (its
+// `uses`-th use), and waited for by every warp: the down's activation, and M0-A's precomputed rows.
+template <typename GL, int N>
+__device__ inline void load_row(const GL& src, int layer, row_sv (&dst)[N], int chunks,
+                                semaphore& sem, int uses) {
+    if (kittens::warpid() % LANE_WARPS == 0) {
+        warp::tma::expect_bytes(sem, uint32_t(chunks * sizeof(row_sv)));
+        for (int c = 0; c < chunks; c++) {
+            warp::tma::load_async(dst[c], src, {0, layer, 0, c}, sem);
+        }
+    }
+    wait(sem, uses % 2);
+}
+
+// A lane's 8 consumer warps at variant `V` (0: the M0 program), over its buffers `sm` (`mlp_smem`,
+// or `lane_smem` under `TWO_LANES`) and its worker index.
+template <int V, typename SM>
+__device__ inline void mlp_consume(const mlp_globals& g, const ring_state& r, const mlp_sems& se,
+                                   const SM& sm, int worker) {
+    constexpr bool PRE_NORM = (V & (NORM_ONCE | QUANT_ONCE)) != 0;
+    constexpr bool PRE_QUANT = (V & QUANT_ONCE) != 0;
+    constexpr bool WAITS = (V & NO_WAIT) == 0;
+    constexpr int GUR = (V & FULL_WAVE) ? GU_ROWS_FULL : GU_ROWS;
+    const int w = kittens::warpid() % LANE_WARPS;
     // Each warp's weight-ring loads so far (the ring's running index), the lane's norms and its
-    // down rows loaded so far (the semaphores' phases).
+    // row loads so far (the semaphores' phases), and its instruction index (the trace's row).
     int j0 = 0;
     int norms = 0;
-    int downs = 0;
+    int rows_loaded = 0;
+    int i = 0;
     play<LANE_WARPS>(
-        g.n, r, LANE_BARRIER,
+        g.n, r, LANE_BARRIER + lane_of(),
         [&](const instruction_sv& ins) {
             const int op = ins[0], layer = ins[1], block = ins[2];
+            stamp(g, worker, i, T_START);
             if (op == OP_GATE_UP) {
-                const int row0 = (block * LANE_WARPS + w) * GU_ROWS;
+                const int row0 = (block * LANE_WARPS + w) * GUR;
                 float a_scale = 0.0f;
-                float gate[GU_ROWS], up[GU_ROWS];
-                dots<GU_ROWS>(
-                    g.gate, sm, se, layer, row0, INTER, GU_CHUNKS, j0,
+                float gate[GUR], up[GUR];
+                dots<GUR>(
+                    g.gate, sm, se, layer, row0, INTER, PRE_QUANT ? sm.pre : sm.row, GU_CHUNKS, j0,
                     [&] {
-                        lane_await(g, ins);
-                        norm_row(g, sm, se, layer, norms);
-                        a_scale = quantize_row(sm.row, sm, se, GU_CHUNKS);
+                        trace_sync(g);
+                        stamp(g, worker, i, T_PRIMED);
+                        if constexpr (WAITS) {
+                            lane_await(g, ins);
+                        }
+                        trace_sync(g);
+                        stamp(g, worker, i, T_WAITED);
+                        if constexpr (PRE_QUANT) {
+                            load_row(g.qrow, layer, sm.pre, GU_CHUNKS, se.act, rows_loaded);
+                            rows_loaded += 1;
+                            a_scale = g.qscale[{0, 0, layer, 0}];
+                            stamp(g, worker, i, T_NORMED);
+                        } else {
+                            if constexpr (PRE_NORM) {
+                                load_row(g.nrow, layer, sm.pre, GU_CHUNKS, se.act, rows_loaded);
+                                rows_loaded += 1;
+                                trace_sync(g);
+                                stamp(g, worker, i, T_NORMED);
+                                a_scale = quantize_row(sm.pre, sm, se, GU_CHUNKS);
+                            } else {
+                                norm_row(g, sm, se, layer, norms);
+                                stamp(g, worker, i, T_NORMED);
+                                a_scale = quantize_row(sm.row, sm, se, GU_CHUNKS);
+                            }
+                        }
+                        stamp(g, worker, i, T_QUANTIZED);
                     },
                     gate);
-                dots<GU_ROWS>(g.up, sm, se, layer, row0, INTER, GU_CHUNKS, j0 + GU_CHUNKS, [] {},
-                              up);
-                const int rows = max(0, min(GU_ROWS, INTER - row0));
+                dots<GUR>(g.up, sm, se, layer, row0, INTER, PRE_QUANT ? sm.pre : sm.row, GU_CHUNKS,
+                          j0 + GU_CHUNKS, [] {}, up);
+                trace_sync(g);
+                stamp(g, worker, i, T_DOTS);
+                const int rows = max(0, min(GUR, INTER - row0));
 #pragma unroll
-                for (int rr = 0; rr < GU_ROWS; rr++) {
+                for (int rr = 0; rr < GUR; rr++) {
                     if (warp::laneid() == 0 && rr < rows) {
                         const float gv = scaled(g.gate_scale, layer, row0 + rr, gate[rr], a_scale);
                         const float uv = scaled(g.up_scale, layer, row0 + rr, up[rr], a_scale);
@@ -625,26 +763,38 @@ __device__ inline void mlp_consume(const mlp_globals& g, const ring_state& r, co
                     }
                 }
                 j0 += rows > 0 ? 2 * GU_CHUNKS : 0;
-                norms += 1;
+                norms += PRE_NORM ? 0 : 1;
             } else if (op == OP_DOWN) {
                 const int row0 = (block * LANE_WARPS + w) * DOWN_ROWS;
                 float a_scale = 0.0f;
                 float dot[DOWN_ROWS];
                 dots<DOWN_ROWS>(
-                    g.down, sm, se, layer, row0, HIDDEN, DOWN_CHUNKS, j0,
+                    g.down, sm, se, layer, row0, HIDDEN, PRE_QUANT ? sm.pre : sm.row, DOWN_CHUNKS,
+                    j0,
                     [&] {
+                        trace_sync(g);
+                        stamp(g, worker, i, T_PRIMED);
                         // Every gate/up block of the layer is stored before its row is read.
-                        lane_await(g, ins);
-                        if (w == 0) {
-                            warp::tma::expect_bytes(se.act, uint32_t(DOWN_CHUNKS * sizeof(row_sv)));
-                            for (int c = 0; c < DOWN_CHUNKS; c++) {
-                                warp::tma::load_async(sm.act[c], g.act, {0, layer, 0, c}, se.act);
-                            }
+                        if constexpr (WAITS) {
+                            lane_await(g, ins);
                         }
-                        wait(se.act, downs % 2);
-                        a_scale = quantize_row(sm.act, sm, se, DOWN_CHUNKS);
+                        trace_sync(g);
+                        stamp(g, worker, i, T_WAITED);
+                        if constexpr (PRE_QUANT) {
+                            load_row(g.qact, layer, sm.pre, DOWN_CHUNKS, se.act, rows_loaded);
+                            rows_loaded += 1;
+                            a_scale = g.qscale[{0, 0, layer, 1}];
+                        } else {
+                            load_row(g.act, layer, sm.act, DOWN_CHUNKS, se.act, rows_loaded);
+                            rows_loaded += 1;
+                            a_scale = quantize_row(sm.act, sm, se, DOWN_CHUNKS);
+                        }
+                        stamp(g, worker, i, T_NORMED);
+                        stamp(g, worker, i, T_QUANTIZED);
                     },
                     dot);
+                trace_sync(g);
+                stamp(g, worker, i, T_DOTS);
                 const int rows = max(0, min(DOWN_ROWS, HIDDEN - row0));
 #pragma unroll
                 for (int rr = 0; rr < DOWN_ROWS; rr++) {
@@ -655,32 +805,100 @@ __device__ inline void mlp_consume(const mlp_globals& g, const ring_state& r, co
                     }
                 }
                 j0 += rows > 0 ? DOWN_CHUNKS : 0;
-                downs += 1;
             }
         },
         [&](const instruction_sv& ins) {
+            stamp(g, worker, i, T_STORED);
             // The instruction's stores are done (the barrier): publish them once.
             if (ins[0] != OP_NOOP && w == 0 && warp::laneid() == 0) {
                 publish(g.counters, ins[5], 1);
             }
+            stamp(g, worker, i, T_ARRIVED);
+            i += 1;
         });
 }
 
-__global__ __launch_bounds__(MLP_THREADS, 1) void mk_mlp_ker(const __grid_constant__ mlp_globals g) {
-    __shared__ sv<int, INSTRUCTION_WIDTH> ring[STAGES];
-    __shared__ semaphore arrived[STAGES], finished[STAGES];
-    __shared__ semaphore norm_arrived[4][2], owned, act, weights[LANE_WARPS][GEMV_STAGES];
-    __shared__ sv_fl<16> amax;
+// The variant's lanes per SM and threads per CTA (8 consumer warps and a controller per lane).
+template <int V>
+constexpr int mlp_lanes() {
+    return (V & TWO_LANES) ? 2 : 1;
+}
+template <int V>
+constexpr int mlp_threads() {
+    return mlp_lanes<V>() * MLP_WARPS * kittens::WARP_THREADS;
+}
+
+template <int V>
+__global__ __launch_bounds__(mlp_threads<V>(), 1) void mk_mlp_ker(const __grid_constant__ mlp_globals g) {
+    constexpr int LN = mlp_lanes<V>();
+    static_assert(!(V & TWO_LANES) || (V & QUANT_ONCE), "two lanes only without the norm's tile");
+    __shared__ sv<int, INSTRUCTION_WIDTH> ring[LN][STAGES];
+    __shared__ semaphore arrived[LN][STAGES], finished[LN][STAGES];
+    __shared__ semaphore norm_arrived[4][2], owned, act[LN], weights[LN][LANE_WARPS][GEMV_STAGES];
+    __shared__ sv_fl<16> amax[LN];
     if (threadIdx.x == 0) {
-        for (int s = 0; s < STAGES; s++) {
-            init_semaphore(arrived[s], 0, 1);
-            init_semaphore(finished[s], LANE_WARPS, 0);
+        for (int l = 0; l < LN; l++) {
+            for (int s = 0; s < STAGES; s++) {
+                init_semaphore(arrived[l][s], 0, 1);
+                init_semaphore(finished[l][s], LANE_WARPS, 0);
+            }
+            init_semaphore(act[l], 0, 1);
+            for (int w = 0; w < LANE_WARPS; w++) {
+                for (int s = 0; s < GEMV_STAGES; s++) {
+                    init_semaphore(weights[l][w][s], 0, 1);
+                }
+            }
         }
         for (int w = 0; w < 4; w++) {
             init_semaphore(norm_arrived[w][0], 0, 1);
             init_semaphore(norm_arrived[w][1], 0, 1);
         }
         init_semaphore(owned, 0, 1);
+    }
+    // Every semaphore is initialised before any thread waits on it or a TMA arrives on it.
+    __syncthreads();
+    const int w = kittens::warpid();
+    if (w < LN * LANE_WARPS) {
+        const int lane = w / LANE_WARPS;
+        const ring_state r{ring[lane], arrived[lane], finished[lane]};
+        const mlp_sems se{norm_arrived, owned, act[lane], weights[lane], amax[lane]};
+        const int worker = LN * int(blockIdx.x) + lane;
+        if constexpr (LN == 1) {
+            mlp_consume<V>(g, r, se, mlp_pages(), worker);
+        } else if (lane == 0) {
+            mlp_consume<V>(g, r, se, lane_pages<0>(), worker);
+        } else {
+            mlp_consume<V>(g, r, se, lane_pages<1>(), worker);
+        }
+    } else if (w < LN * LANE_WARPS + LN) {
+        const int lane = w - LN * LANE_WARPS;
+        const ring_state r{ring[lane], arrived[lane], finished[lane]};
+        control(g.instructions, g.n, LN * int(blockIdx.x) + lane, r);
+    }
+    // No warp leaves while another may still arrive on a semaphore it waits on.
+    __syncthreads();
+}
+
+// M0-A's chain outside the megakernel (test support): one plain launch of the gate/up GEMV + GeLU
+// over a normed row, `GUR` rows a warp (4: today's 66 CTAs; 2: the full wave's 132), each CTA the
+// body of `OP_GATE_UP` under `NORM_ONCE` (the row TMA-loaded, `quantize_row`, the gate's and the
+// up's dots, the stores): today's `gate_up_gemv_fp8_ker<false, gelu_tanh_mul>` per CTA. `layer` is
+// the layer of `g`'s weights, `nrow` and `act` it reads and writes.
+constexpr int PLAIN_SMEM_BYTES =
+    int((2 * ROW_CHUNKS + DOWN_CHUNKS) * sizeof(row_sv) +
+        LANE_WARPS * GEMV_STAGES * GU_ROWS * sizeof(w_sv)) +
+    4 * 1024;
+
+constexpr int PLAIN_THREADS = LANE_WARPS * kittens::WARP_THREADS;
+
+// The plain launch's layer rides in `g.n` (its one parameter is the globals, as every kernel's).
+template <int GUR>
+__global__ __launch_bounds__(PLAIN_THREADS, 1) void mk_gate_up_plain_ker(
+    const __grid_constant__ mlp_globals g) {
+    const int layer = g.n;
+    __shared__ semaphore norm_arrived[4][2], owned, act, weights[LANE_WARPS][GEMV_STAGES];
+    __shared__ sv_fl<16> amax;
+    if (threadIdx.x == 0) {
         init_semaphore(act, 0, 1);
         for (int w = 0; w < LANE_WARPS; w++) {
             for (int s = 0; s < GEMV_STAGES; s++) {
@@ -688,17 +906,31 @@ __global__ __launch_bounds__(MLP_THREADS, 1) void mk_mlp_ker(const __grid_consta
             }
         }
     }
-    // Every semaphore is initialised before any thread waits on it or a TMA arrives on it.
     __syncthreads();
-    const ring_state r{ring, arrived, finished};
-    if (kittens::warpid() < LANE_WARPS) {
-        const mlp_sems se{norm_arrived, owned, act, weights, amax};
-        mlp_consume(g, r, se);
-    } else {
-        control(g.instructions, g.n, int(blockIdx.x), r);
+    const lane_smem sm = lane_pages<0>();
+    const mlp_sems se{norm_arrived, owned, act, weights, amax};
+    const int w = kittens::warpid();
+    const int row0 = (int(blockIdx.x) * LANE_WARPS + w) * GUR;
+    float a_scale = 0.0f;
+    float gate[GUR], up[GUR];
+    dots<GUR>(
+        g.gate, sm, se, layer, row0, INTER, sm.row, GU_CHUNKS, 0,
+        [&] {
+            load_row(g.nrow, layer, sm.pre, GU_CHUNKS, se.act, 0);
+            a_scale = quantize_row(sm.pre, sm, se, GU_CHUNKS);
+        },
+        gate);
+    dots<GUR>(g.up, sm, se, layer, row0, INTER, sm.row, GU_CHUNKS, GU_CHUNKS, [] {}, up);
+    const int rows = max(0, min(GUR, INTER - row0));
+#pragma unroll
+    for (int rr = 0; rr < GUR; rr++) {
+        if (warp::laneid() == 0 && rr < rows) {
+            const float gv = scaled(g.gate_scale, layer, row0 + rr, gate[rr], a_scale);
+            const float uv = scaled(g.up_scale, layer, row0 + rr, up[rr], a_scale);
+            g.act[{0, layer, 0, row0 + rr}] = base_types::convertor<bf16, float>::convert(
+                scratchy::ops::gelu_tanh_mul::op<float>(gv, uv));
+        }
     }
-    // No warp leaves while another may still arrive on a semaphore it waits on.
-    __syncthreads();
 }
 
 // The MLP program's operands, as the launcher was given them.
@@ -714,7 +946,65 @@ struct mlp_args {
     const void* down = nullptr;
     const void* down_scale = nullptr;
     void* act = nullptr;
+    // M0-A only (null in the M0 entry).
+    const void* nrow = nullptr;
+    const void* qrow = nullptr;
+    const void* qact = nullptr;
+    const void* qscale = nullptr;
+    void* trace = nullptr;
 };
+
+// The variants the ablation entry plays (M0-A), by the flags' value.
+constexpr int V1 = NORM_ONCE;
+constexpr int V2 = NORM_ONCE | QUANT_ONCE;
+constexpr int V3 = NO_WAIT;
+constexpr int V4 = FULL_WAVE;
+constexpr int V5 = NORM_ONCE | QUANT_ONCE | TWO_LANES;
+constexpr int V6 = NORM_ONCE | QUANT_ONCE | FULL_WAVE | TWO_LANES;
+
+// The MLP program's views over `a`, `layers` and `workers` instruction rows. Can throw.
+inline mlp_globals mlp_views(const mlp_args& a, uint32_t n, uint32_t counter_count,
+                             uint32_t layers, uint32_t workers, float eps, float gain_offset) {
+    const auto bf = [](const void* p) { return static_cast<bf16*>(const_cast<void*>(p)); };
+    const auto e4 = [](const void* p) { return static_cast<fp8e4m3*>(const_cast<void*>(p)); };
+    const auto f = [](const void* p) { return static_cast<float*>(const_cast<void*>(p)); };
+    const size_t L = layers;
+    // The views of absent M0-A buffers point at `h` (never read): a view needs an address.
+    const auto or_h = [&](const void* p) { return p != nullptr ? p : a.h; };
+    instruction_gl ig{static_cast<int*>(const_cast<void*>(a.instructions)), nullptr,
+                      size_t(workers), size_t(n), nullptr};
+    counter_gl cg{static_cast<uint32_t*>(a.counters), nullptr, nullptr, nullptr,
+                  size_t(counter_count)};
+    x_gl xg{bf(a.h), nullptr, L + 1, nullptr, nullptr};
+    out_gl yg{bf(a.h), nullptr, L + 1, nullptr, nullptr};
+    gain_gl gg{bf(a.gain), nullptr, nullptr, L, nullptr};
+    weight_gl gate_g{e4(a.gate), nullptr, L, size_t(INTER), size_t(HIDDEN)};
+    weight_gl up_g{e4(a.up), nullptr, L, size_t(INTER), size_t(HIDDEN)};
+    weight_gl down_g{e4(a.down), nullptr, L, size_t(HIDDEN), size_t(INTER)};
+    scale_gl gs{f(a.gate_scale), nullptr, nullptr, L, size_t(INTER)};
+    scale_gl us{f(a.up_scale), nullptr, nullptr, L, size_t(INTER)};
+    scale_gl ds{f(a.down_scale), nullptr, nullptr, L, size_t(HIDDEN)};
+    act_gl ag{bf(a.act), nullptr, L, nullptr, nullptr};
+    x_gl ng{bf(or_h(a.nrow)), nullptr, L, nullptr, nullptr};
+    x_gl qg{bf(or_h(a.qrow)), nullptr, L, nullptr, nullptr};
+    act_gl qa{bf(or_h(a.qact)), nullptr, L, nullptr, nullptr};
+    qscale_gl qs{f(or_h(a.qscale)), nullptr, nullptr, L, nullptr};
+    trace_gl tg{static_cast<uint64_t*>(a.trace != nullptr ? a.trace : a.h), nullptr,
+                size_t(workers), size_t(n), nullptr};
+    return mlp_globals{ig, cg, xg, yg, gg, gate_g, up_g, down_g, gs, us, ds, ag,
+                       ng, qg, qa, qs, tg, a.trace != nullptr ? 1 : 0, eps, gain_offset, int(n)};
+}
+
+// Launch variant `V`'s cooperative grid.
+template <int V>
+int launch_mlp(const mlp_globals& G, void* stream) {
+    mlp_globals g = G;
+    void* args[] = {&g};
+    const dim3 grid{uint32_t(SMS)}, block{uint32_t(mlp_threads<V>())};
+    return static_cast<int>(cudaLaunchCooperativeKernel(mk_mlp_ker<V>, grid, block, args,
+                                                        MK_SMEM_BYTES,
+                                                        static_cast<cudaStream_t>(stream)));
+}
 
 // The launch's operands, as the launcher was given them.
 struct mk_args {
@@ -735,8 +1025,24 @@ extern "C" int scratchy_cuda_mk_prepare(void) {
     for (const cudaError_t e : {
              cudaFuncSetAttribute(mk_test_ker, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                   MK_SMEM_BYTES),
-             cudaFuncSetAttribute(mk_mlp_ker, cudaFuncAttributeMaxDynamicSharedMemorySize,
+             cudaFuncSetAttribute(mk_mlp_ker<0>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                   MK_SMEM_BYTES),
+             cudaFuncSetAttribute(mk_mlp_ker<V1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  MK_SMEM_BYTES),
+             cudaFuncSetAttribute(mk_mlp_ker<V2>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  MK_SMEM_BYTES),
+             cudaFuncSetAttribute(mk_mlp_ker<V3>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  MK_SMEM_BYTES),
+             cudaFuncSetAttribute(mk_mlp_ker<V4>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  MK_SMEM_BYTES),
+             cudaFuncSetAttribute(mk_mlp_ker<V5>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  MK_SMEM_BYTES),
+             cudaFuncSetAttribute(mk_mlp_ker<V6>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  MK_SMEM_BYTES),
+             cudaFuncSetAttribute(mk_gate_up_plain_ker<GU_ROWS>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, PLAIN_SMEM_BYTES),
+             cudaFuncSetAttribute(mk_gate_up_plain_ker<GU_ROWS_FULL>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, PLAIN_SMEM_BYTES),
          }) {
         if (e != cudaSuccess) {
             return static_cast<int>(e);
@@ -789,33 +1095,108 @@ extern "C" int scratchy_cuda_mk_mlp_test(const void* instructions, uint32_t n, v
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
     try {
-        const mlp_args a{instructions, counters, h, gain, gate, gate_scale, up, up_scale,
-                         down, down_scale, act};
-        const auto bf = [](const void* p) { return static_cast<bf16*>(const_cast<void*>(p)); };
-        const auto e4 = [](const void* p) { return static_cast<fp8e4m3*>(const_cast<void*>(p)); };
-        const auto f = [](const void* p) { return static_cast<float*>(const_cast<void*>(p)); };
-        const size_t L = layers;
-        instruction_gl ig{static_cast<int*>(const_cast<void*>(a.instructions)), nullptr,
-                          size_t(SMS), size_t(n), nullptr};
-        counter_gl cg{static_cast<uint32_t*>(a.counters), nullptr, nullptr, nullptr,
-                      size_t(counter_count)};
-        x_gl xg{bf(a.h), nullptr, L + 1, nullptr, nullptr};
-        out_gl yg{bf(a.h), nullptr, L + 1, nullptr, nullptr};
-        gain_gl gg{bf(a.gain), nullptr, nullptr, L, nullptr};
-        weight_gl gate_g{e4(a.gate), nullptr, L, size_t(INTER), size_t(HIDDEN)};
-        weight_gl up_g{e4(a.up), nullptr, L, size_t(INTER), size_t(HIDDEN)};
-        weight_gl down_g{e4(a.down), nullptr, L, size_t(HIDDEN), size_t(INTER)};
-        scale_gl gs{f(a.gate_scale), nullptr, nullptr, L, size_t(INTER)};
-        scale_gl us{f(a.up_scale), nullptr, nullptr, L, size_t(INTER)};
-        scale_gl ds{f(a.down_scale), nullptr, nullptr, L, size_t(HIDDEN)};
-        act_gl ag{bf(a.act), nullptr, L, nullptr, nullptr};
-        mlp_globals G{ig, cg, xg, yg, gg, gate_g, up_g, down_g, gs, us, ds, ag, eps, gain_offset,
-                      int(n)};
+        const mlp_args a{instructions, counters, h,  gain, gate, gate_scale,
+                         up,           up_scale, down, down_scale, act};
+        return launch_mlp<0>(mlp_views(a, n, counter_count, layers, SMS, eps, gain_offset), stream);
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}
+
+// Test support (`tests/megakernel.rs`), M0-A's ablation: `scratchy_cuda_mk_mlp_test` at variant
+// `variant` (0, or one of `V1`..`V6`), the lists `[workers, n, 32]` (`workers` 132, or 264 under
+// `TWO_LANES`), with the precomputed rows the variant reads (`nrow [layers, 2816]` bf16 the normed
+// rows; `qrow [layers, 2816]`, `qact [layers, 2112]` bf16 the quantized rows' e4m3 values;
+// `qscale [layers, 2]` f32 their scales) and, when `trace` is not null, `[workers, n, 8]` u64 of
+// `clock64` stamps. A null row the variant reads, or another variant, is refused, as are the
+// shapes `scratchy_cuda_mk_mlp_test` refuses.
+extern "C" int scratchy_cuda_mk_mlp_ablation(
+    uint32_t variant, const void* instructions, uint32_t n, void* counters, uint32_t counter_count,
+    void* h, const void* gain, const void* gate, const void* gate_scale, const void* up,
+    const void* up_scale, const void* down, const void* down_scale, void* act, uint32_t layers,
+    float eps, float gain_offset, const void* nrow, const void* qrow, const void* qact,
+    const void* qscale, void* trace, void* stream /* cudaStream_t; null = default */) {
+    const int v = int(variant);
+    const bool known = v == 0 || v == V1 || v == V2 || v == V3 || v == V4 || v == V5 || v == V6;
+    const bool rows = (!(v & NORM_ONCE) || (v & QUANT_ONCE) || nrow != nullptr) &&
+                      (!(v & QUANT_ONCE) || (qrow != nullptr && qact != nullptr && qscale != nullptr));
+    if (!known || !rows || n == 0 || n > uint32_t(INT_MAX) || layers == 0 ||
+        layers >= uint32_t(INT_MAX) || counter_count == 0 || counter_count > uint32_t(INT_MAX) ||
+        !(eps > 0.0f && eps <= 3.0e38f)) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    if (const int e = check_sms(); e != 0) {
+        return e;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        const uint32_t workers = (v & TWO_LANES) ? uint32_t(2 * SMS) : uint32_t(SMS);
+        const mlp_args a{instructions, counters, h,    gain, gate, gate_scale, up,  up_scale,
+                         down,         down_scale, act, nrow, qrow, qact,       qscale, trace};
+        const mlp_globals G = mlp_views(a, n, counter_count, layers, workers, eps, gain_offset);
+        switch (v) {
+            case V1:
+                return launch_mlp<V1>(G, stream);
+            case V2:
+                return launch_mlp<V2>(G, stream);
+            case V3:
+                return launch_mlp<V3>(G, stream);
+            case V4:
+                return launch_mlp<V4>(G, stream);
+            case V5:
+                return launch_mlp<V5>(G, stream);
+            case V6:
+                return launch_mlp<V6>(G, stream);
+            default:
+                return launch_mlp<0>(G, stream);
+        }
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}
+
+// Test support (`tests/megakernel.rs`), M0-A's chain outside the megakernel: one plain launch of
+// `mk_gate_up_plain_ker` for layer `layer` of `layers`, at 66 CTAs of 4 rows a warp or, with
+// `full_wave`, 132 of 2: `act[layer] = gelu_tanh_mul(gate(q), up(q))`, `q` the quantized
+// `nrow[layer]`. Refused (SCRATCHY_CUDA_ERR_SHAPE) when `layer` is not below `layers` or `layers`
+// is zero or at INT_MAX. Asynchronous on `stream`.
+extern "C" int scratchy_cuda_mk_gate_up_plain(uint32_t full_wave, const void* gate,
+                                              const void* gate_scale, const void* up,
+                                              const void* up_scale, const void* nrow, void* act,
+                                              uint32_t layers, uint32_t layer,
+                                              void* stream /* cudaStream_t; null = default */) {
+    if (layers == 0 || layers >= uint32_t(INT_MAX) || layer >= layers) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        // Only the gate/up's views are read; the others view `act` (a view needs an address).
+        mlp_args a{};
+        a.instructions = act;
+        a.counters = act;
+        a.h = act;
+        a.gain = act;
+        a.gate = gate;
+        a.gate_scale = gate_scale;
+        a.up = up;
+        a.up_scale = up_scale;
+        a.down = gate;
+        a.down_scale = gate_scale;
+        a.act = act;
+        a.nrow = nrow;
+        mlp_globals G = mlp_views(a, 1, 1, layers, 1, 1.0f, 0.0f);
+        G.n = int(layer);
         void* args[] = {&G};
-        const dim3 grid{uint32_t(SMS)}, block{uint32_t(MLP_THREADS)};
-        return static_cast<int>(cudaLaunchCooperativeKernel(mk_mlp_ker, grid, block, args,
-                                                            MK_SMEM_BYTES,
-                                                            static_cast<cudaStream_t>(stream)));
+        const dim3 block{uint32_t(PLAIN_THREADS)};
+        const cudaStream_t s = static_cast<cudaStream_t>(stream);
+        if (full_wave) {
+            const dim3 grid{uint32_t(GU_BLOCKS_FULL)};
+            return static_cast<int>(cudaLaunchKernel(mk_gate_up_plain_ker<GU_ROWS_FULL>, grid,
+                                                     block, args, PLAIN_SMEM_BYTES, s));
+        }
+        const dim3 grid{uint32_t(GU_BLOCKS)};
+        return static_cast<int>(cudaLaunchKernel(mk_gate_up_plain_ker<GU_ROWS>, grid, block, args,
+                                                 PLAIN_SMEM_BYTES, s));
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }

@@ -9,6 +9,7 @@
 
 // `pub`: each test binary uses a different part of `common`, and nothing in it is dead code.
 pub mod common {
+    pub mod fp8;
     pub mod numerics;
     pub mod watchdog;
 }
@@ -19,6 +20,10 @@ use scratchy_target_cuda::kernels::{
     MK_MLP_INTER, MK_MLP_WORKERS, MK_OP_CHAIN, MK_OP_DOWN, MK_OP_GATE_UP, MK_OP_NOOP,
     MK_OP_PAGE_ECHO, MK_PAGE_FLOATS, MK_WORKERS, MkMlpWeights, gate_up_gemv_fp8, gemv_fp8_residual,
     mk_mlp_test, mk_test, rms_norm_bf16,
+};
+use scratchy_target_cuda::kernels::{
+    MK_MLP_FULL_WAVE, MK_MLP_NO_WAIT, MK_MLP_NORM_ONCE, MK_MLP_QUANT_ONCE, MK_MLP_TWO_LANES,
+    MK_TRACE_WIDTH, MkMlpRows, mk_gate_up_plain, mk_mlp_ablation,
 };
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
 use scratchy_target_cuda::step::GatedOp;
@@ -563,5 +568,373 @@ fn the_megakernel_mlp_time_is_recorded() {
         } else {
             "FAIL"
         }
+    );
+}
+
+// ── M0-A: the ablation (timing only) ───────────────────────────────
+
+/// The six ablation variants and M0's program (V0), as `(name, flags, bits kept)`: a variant keeps
+/// the bits when every value it reads is the one M0's program computes in the same order.
+const VARIANTS: [(&str, u32, bool); 7] = [
+    ("V0", 0, true),
+    ("V1_norm_once", MK_MLP_NORM_ONCE, true),
+    ("V2_no_requant", MK_MLP_NORM_ONCE | MK_MLP_QUANT_ONCE, true),
+    ("V3_no_barriers", MK_MLP_NO_WAIT, false),
+    ("V4_full_wave", MK_MLP_FULL_WAVE, true),
+    (
+        "V5_two_lanes",
+        MK_MLP_NORM_ONCE | MK_MLP_QUANT_ONCE | MK_MLP_TWO_LANES,
+        true,
+    ),
+    (
+        "V6_all",
+        MK_MLP_NORM_ONCE | MK_MLP_QUANT_ONCE | MK_MLP_FULL_WAVE | MK_MLP_TWO_LANES,
+        true,
+    ),
+];
+
+/// M0-A's precomputed rows: per layer the normed row, the gate/up's and the down's quantized rows
+/// (e4m3 values as bf16) and their scales, from today's own kernels over the chain's real inputs
+/// (`h` and `act` per layer), so every variant reads what the program would compute; and the
+/// chain's `h` and activations themselves (`NO_WAIT` starts with them in place).
+struct Pre {
+    h: Vec<u16>,
+    acts: Vec<u16>,
+    nrow: DeviceBuffer,
+    qrow: DeviceBuffer,
+    qact: DeviceBuffer,
+    qscale: DeviceBuffer,
+}
+
+/// Today's chain over `m` again, keeping every layer's normed row and activation; then their
+/// quantization on the host (`common::fp8::quantize_rows`, vLLM's formula, `quant_rows_fp8`'s bits
+/// and so the GEMV prologue's, `the_prologue_quantizes_as_quant_rows_fp8`).
+fn pre(device: &CudaDevice, m: &Mlp) -> Pre {
+    use common::fp8::{e4m3_to_bf16_bits, quantize_rows};
+    let (hd, i) = (MK_MLP_HIDDEN, MK_MLP_INTER);
+    let h = chain(device, m, &mut once);
+    let hb = DeviceBuffer::upload(device, &h).expect("h");
+    let n = DeviceBuffer::upload(device, &vec![0u16; hd]).expect("n");
+    let act = DeviceBuffer::upload(device, &vec![0u16; i]).expect("act");
+    let null = std::ptr::null_mut();
+    let (mut nrows, mut acts) = (Vec::new(), Vec::new());
+    for l in 0..m.layers {
+        // SAFETY: as `chain`'s.
+        unsafe {
+            rms_norm_bf16(
+                at(&hb, 2 * l * hd).cast_const(),
+                at(&m.gain, 2 * l * hd).cast_const(),
+                n.ptr(),
+                (1, hd as u32),
+                MLP_EPS,
+                MLP_GAIN_OFFSET,
+                null,
+            )
+            .expect("norm");
+            gate_up_gemv_fp8(
+                (
+                    n.ptr().cast_const(),
+                    (
+                        at(&m.gate.0, l * i * hd).cast_const(),
+                        at(&m.gate.1, 4 * l * i).cast_const(),
+                    ),
+                    (
+                        at(&m.up.0, l * i * hd).cast_const(),
+                        at(&m.up.1, 4 * l * i).cast_const(),
+                    ),
+                ),
+                (act.ptr(), null),
+                (i as u32, hd as u32, 1),
+                MLP_ACT.code(),
+                null,
+            )
+            .expect("gate/up");
+        }
+        nrows.extend(n.download().expect("n"));
+        acts.extend(act.download().expect("act"));
+    }
+    let (qn, sn) = quantize_rows(&nrows, m.layers, hd);
+    let (qa, sa) = quantize_rows(&acts, m.layers, i);
+    let scales: Vec<u8> = (sn.iter().zip(&sa))
+        .flat_map(|(a, b)| [*a, *b])
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let up = |v: &[u16]| DeviceBuffer::upload(device, v).expect("upload");
+    Pre {
+        h,
+        acts: acts.clone(),
+        nrow: up(&nrows),
+        qrow: up(&e4m3_to_bf16_bits(&qn)),
+        qact: up(&e4m3_to_bf16_bits(&qa)),
+        qscale: DeviceBuffer::upload_bytes(device, &scales).expect("scales"),
+    }
+}
+
+/// The variant's lists: `mlp_lists`, with no waits under `NO_WAIT`, at 132 gate/up blocks under
+/// `FULL_WAVE`, and over 264 workers under `TWO_LANES`.
+fn variant_lists(layers: usize, flags: u32) -> (Lists, usize) {
+    let workers = if flags & MK_MLP_TWO_LANES != 0 {
+        2 * MK_MLP_WORKERS
+    } else {
+        MK_MLP_WORKERS
+    };
+    let gu = if flags & MK_MLP_FULL_WAVE != 0 {
+        2 * MK_MLP_GATE_UP_BLOCKS
+    } else {
+        MK_MLP_GATE_UP_BLOCKS
+    };
+    let waits = flags & MK_MLP_NO_WAIT == 0;
+    let mut per: Vec<Vec<[i32; 6]>> = vec![Vec::new(); workers];
+    let mut next = 0usize;
+    for l in 0..layers as i32 {
+        for b in 0..gu as i32 {
+            let (wait, want) = match (waits, l) {
+                (false, _) | (true, 0) => (0, 0),
+                (true, _) => (2 * l - 1, MK_MLP_DOWN_BLOCKS as i32),
+            };
+            per[next % workers].push([MK_OP_GATE_UP, l, b, wait, want, 2 * l]);
+            next += 1;
+        }
+        for b in 0..MK_MLP_DOWN_BLOCKS as i32 {
+            let want = if waits { gu as i32 } else { 0 };
+            per[next % workers].push([MK_OP_DOWN, l, b, 2 * l, want, 2 * l + 1]);
+            next += 1;
+        }
+    }
+    let n = per.iter().map(Vec::len).max().unwrap_or(1);
+    let mut lists = Lists::of(workers, n);
+    for (w, ins) in per.iter().enumerate() {
+        for (i, a) in ins.iter().enumerate() {
+            lists.set(w, i, a[0], &a[1..]);
+        }
+    }
+    (lists, workers)
+}
+
+/// One variant over `m`: its `h` rows after one play, its event-timed median µs (untraced), and one
+/// traced play's stamps (`[workers, n, MK_TRACE_WIDTH]` u64) with its lists.
+struct Played {
+    h: Vec<u16>,
+    us: f64,
+    trace: Vec<u64>,
+    lists: Lists,
+    workers: usize,
+}
+
+fn play_variant(device: &CudaDevice, m: &Mlp, p: &Pre, flags: u32) -> Played {
+    let (hd, i) = (MK_MLP_HIDDEN, MK_MLP_INTER);
+    let (lists, workers) = variant_lists(m.layers, flags);
+    let counters = 2 * m.layers;
+    // `NO_WAIT` reads a layer's input and activation with no wait for their producers: they are
+    // the chain's, in place before the launch (so each play reads data, not a race).
+    let no_wait = flags & MK_MLP_NO_WAIT != 0;
+    let mut h0 = m.h0.clone();
+    h0.resize((m.layers + 1) * hd, 0);
+    let h0 = if no_wait { p.h.clone() } else { h0 };
+    let a0 = if no_wait {
+        p.acts.clone()
+    } else {
+        vec![0u16; m.layers * i]
+    };
+    let h = DeviceBuffer::upload(device, &h0).expect("h");
+    let act = DeviceBuffer::upload(device, &a0).expect("act");
+    let ins = DeviceBuffer::upload_bytes(device, &lists.bytes()).expect("lists");
+    let c = DeviceBuffer::upload_bytes(device, &vec![0u8; 4 * counters]).expect("counters");
+    let tr = DeviceBuffer::upload_bytes(device, &vec![0u8; 8 * workers * lists.n * MK_TRACE_WIDTH])
+        .expect("trace");
+    let w = MkMlpWeights {
+        gain: m.gain.ptr().cast_const(),
+        gate: (m.gate.0.ptr().cast_const(), m.gate.1.ptr().cast_const()),
+        up: (m.up.0.ptr().cast_const(), m.up.1.ptr().cast_const()),
+        down: (m.down.0.ptr().cast_const(), m.down.1.ptr().cast_const()),
+    };
+    let rows = MkMlpRows {
+        nrow: p.nrow.ptr().cast_const(),
+        qrow: p.qrow.ptr().cast_const(),
+        qact: p.qact.ptr().cast_const(),
+        qscale: p.qscale.ptr().cast_const(),
+    };
+    let launch = |trace: *mut std::ffi::c_void| {
+        // SAFETY: `c` holds `counters` u32; null is the default stream.
+        unsafe { cuda_memset(c.ptr(), 4 * counters) };
+        // SAFETY: as `megakernel`'s; the rows and the trace hold what the variant reads and writes.
+        unsafe {
+            mk_mlp_ablation(
+                (flags, trace),
+                (ins.ptr().cast_const(), lists.n as u32),
+                (c.ptr(), counters as u32),
+                (h.ptr(), act.ptr()),
+                (w, rows),
+                (m.layers as u32, MLP_EPS, MLP_GAIN_OFFSET),
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("ablation");
+    };
+    launch(std::ptr::null_mut());
+    let hout = h.download().expect("h");
+    let us = event_median(&mut || launch(std::ptr::null_mut()));
+    launch(tr.ptr());
+    let bytes = tr.download().expect("trace");
+    let trace = (bytes.as_chunks::<4>().0.iter())
+        .map(|q| {
+            u64::from(q[0])
+                | (u64::from(q[1]) << 16)
+                | (u64::from(q[2]) << 32)
+                | (u64::from(q[3]) << 48)
+        })
+        .collect();
+    Played {
+        h: hout,
+        us,
+        trace,
+        lists,
+        workers,
+    }
+}
+
+/// The SM clock in kHz (`cudaDevAttrClockRate`), to turn `clock64` ticks into µs.
+fn sm_clock_khz() -> f64 {
+    unsafe extern "C" {
+        fn cudaGetDevice(device: *mut i32) -> i32;
+        fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> i32;
+    }
+    const CUDA_DEV_ATTR_CLOCK_RATE: i32 = 13;
+    let (mut dev, mut khz) = (0i32, 0i32);
+    // SAFETY: plain runtime queries with out-pointers to locals.
+    unsafe {
+        assert_eq!(cudaGetDevice(&mut dev), 0, "cudaGetDevice");
+        assert_eq!(
+            cudaDeviceGetAttribute(&mut khz, CUDA_DEV_ATTR_CLOCK_RATE, dev),
+            0,
+            "clock rate"
+        );
+    }
+    f64::from(khz)
+}
+
+/// The phases a stamp pair spans (`T_*` of the kernel), in the output's order.
+const PHASES: [(&str, usize, usize); 6] = [
+    ("prime", 0, 1),
+    ("wait", 1, 2),
+    ("norm", 2, 3),
+    ("quant", 3, 4),
+    ("dots", 4, 5),
+    ("store_arrive", 5, 7),
+];
+
+/// The variant's line per opcode: per phase the mean and max µs over its instructions, and the
+/// critical path: per layer the slowest instruction of each opcode, wait excluded, summed.
+fn report(name: &str, pl: &Played, layers: usize, khz: f64) -> Vec<String> {
+    let us = |ticks: u64| ticks as f64 / khz * 1e3;
+    let mut out = Vec::new();
+    let mut crit = vec![[0.0f64; 2]; layers];
+    for (op, label) in [(MK_OP_GATE_UP, "gate_up"), (MK_OP_DOWN, "down")] {
+        let mut sums = [0.0f64; PHASES.len()];
+        let mut maxs = [0.0f64; PHASES.len()];
+        let mut count = 0usize;
+        for w in 0..pl.workers {
+            for i in 0..pl.lists.n {
+                let at = (w * pl.lists.n + i) * MK_INSTRUCTION_WIDTH;
+                if pl.lists.words[at] != op {
+                    continue;
+                }
+                let layer = pl.lists.words[at + 1] as usize;
+                let t = &pl.trace[(w * pl.lists.n + i) * MK_TRACE_WIDTH..][..MK_TRACE_WIDTH];
+                count += 1;
+                let mut busy = 0.0;
+                for (k, &(_, a, b)) in PHASES.iter().enumerate() {
+                    let d = us(t[b].saturating_sub(t[a]));
+                    sums[k] += d;
+                    maxs[k] = maxs[k].max(d);
+                    if k != 1 {
+                        busy += d;
+                    }
+                }
+                let slot = usize::from(op == MK_OP_DOWN);
+                crit[layer][slot] = crit[layer][slot].max(busy);
+            }
+        }
+        let phases: Vec<String> = (PHASES.iter().enumerate())
+            .map(|(k, &(p, ..))| format!("{p} {:.2}/{:.2}", sums[k] / count.max(1) as f64, maxs[k]))
+            .collect();
+        out.push(format!(
+            "M0A {name} {label} instructions {count} | {} (mean/max us)",
+            phases.join(" | ")
+        ));
+    }
+    let path: f64 = crit.iter().map(|c| c[0] + c[1]).sum();
+    out.insert(
+        0,
+        format!(
+            "M0A {name} total_us {:.1} | critical_path_us {path:.1} (per layer the slowest gate/up \
+             and down, waits excluded) | per layer {:.2}",
+            pl.us,
+            pl.us / layers as f64
+        ),
+    );
+    out
+}
+
+/// M0-A, recorded (timing only, the user's request 2026-11-10): M0's program (V0) and the six
+/// variants over 30 layers, each its event-timed total and, from one traced play, the per-phase
+/// µs per opcode and the critical path; whether each keeps the bits against today's chain; then
+/// the matching numbers without the megakernel: today's chain as plain launches, and the gate/up
+/// at 66 and at 132 plain CTAs. Recorded, not asserted.
+#[test]
+fn the_megakernel_ablation_is_recorded() {
+    let device = h100();
+    let layers = 30;
+    let m = mlp(&device, layers, 0x4D41);
+    let want = chain(&device, &m, &mut once);
+    let p = pre(&device, &m);
+    let khz = sm_clock_khz();
+    eprintln!("M0A sm_clock_khz {khz}");
+    let hd = MK_MLP_HIDDEN;
+    for (name, flags, bits) in VARIANTS {
+        let pl = play_variant(&device, &m, &p, flags);
+        for line in report(name, &pl, layers, khz) {
+            eprintln!("{line}");
+        }
+        let bad = mismatched_bits(&pl.h[hd..], &want[hd..]);
+        eprintln!(
+            "M0A {name} bits mismatched_bits={bad} (expected {})",
+            if bits {
+                "0: bits kept"
+            } else {
+                "any: not bit-identical by design"
+            }
+        );
+    }
+    // Without the megakernel.
+    let mut plain = 0.0;
+    chain(&device, &m, &mut |f| plain = event_median(f));
+    let i = MK_MLP_INTER;
+    let act = DeviceBuffer::upload(&device, &vec![0u16; layers * i]).expect("act");
+    let gate_up = |full: bool| {
+        event_median(&mut || {
+            for l in 0..layers {
+                // SAFETY: the layer's weights, normed row and activation are inside their buffers.
+                unsafe {
+                    mk_gate_up_plain(
+                        full,
+                        (
+                            (m.gate.0.ptr().cast_const(), m.gate.1.ptr().cast_const()),
+                            (m.up.0.ptr().cast_const(), m.up.1.ptr().cast_const()),
+                        ),
+                        (p.nrow.ptr().cast_const(), act.ptr()),
+                        (layers as u32, l as u32),
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("plain gate/up");
+            }
+        })
+    };
+    let (gu66, gu132) = (gate_up(false), gate_up(true));
+    eprintln!(
+        "M0A_CHAIN plain {plain:.1} fullwave {:.1} | gate_up alone x30: 66 CTAs {gu66:.1} 132 CTAs \
+         {gu132:.1} (the full-wave chain = plain - 66 + 132)",
+        plain - gu66 + gu132
     );
 }

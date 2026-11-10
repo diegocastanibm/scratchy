@@ -701,6 +701,43 @@ unsafe extern "C" {
         gain_offset: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_mk_mlp_ablation(
+        variant: u32,
+        instructions: *const c_void,
+        n: u32,
+        counters: *mut c_void,
+        counter_count: u32,
+        h: *mut c_void,
+        gain: *const c_void,
+        gate: *const c_void,
+        gate_scale: *const c_void,
+        up: *const c_void,
+        up_scale: *const c_void,
+        down: *const c_void,
+        down_scale: *const c_void,
+        act: *mut c_void,
+        layers: u32,
+        eps: f32,
+        gain_offset: f32,
+        nrow: *const c_void,
+        qrow: *const c_void,
+        qact: *const c_void,
+        qscale: *const c_void,
+        trace: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_mk_gate_up_plain(
+        full_wave: u32,
+        gate: *const c_void,
+        gate_scale: *const c_void,
+        up: *const c_void,
+        up_scale: *const c_void,
+        nrow: *const c_void,
+        act: *mut c_void,
+        layers: u32,
+        layer: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_tma_box_probe_store(
         pattern: *const c_void,
         dst: *mut c_void,
@@ -2350,6 +2387,32 @@ pub const MK_MLP_INTER: usize = 2112;
 pub const MK_MLP_GATE_UP_BLOCKS: usize = 66;
 pub const MK_MLP_DOWN_BLOCKS: usize = 176;
 
+/// M0-A's ablation variants of the MLP program ([`mk_mlp_ablation`]), as flag sets: the norm read
+/// precomputed; the quantized rows read precomputed (and the norm); no counter wait; the gate/up
+/// at 132 blocks of 16 rows; two lanes per SM; and the last four together. `0` is M0's program.
+pub const MK_MLP_NORM_ONCE: u32 = 1;
+pub const MK_MLP_QUANT_ONCE: u32 = 2;
+pub const MK_MLP_NO_WAIT: u32 = 4;
+pub const MK_MLP_FULL_WAVE: u32 = 8;
+pub const MK_MLP_TWO_LANES: u32 = 16;
+/// The trace's stamps per instruction ([`mk_mlp_ablation`]): start, after the weight prime, after
+/// the wait, after the norm (or the row load), after the quantize, after the dots, after the
+/// stores (the lane's barrier), after the publish.
+pub const MK_TRACE_WIDTH: usize = 8;
+
+/// M0-A's precomputed rows for [`mk_mlp_ablation`]: each a device pointer, null when the variant
+/// does not read it.
+#[derive(Clone, Copy, Debug)]
+pub struct MkMlpRows {
+    /// `[layers, MK_MLP_HIDDEN]` bf16, each layer's normed row (`MK_MLP_NORM_ONCE`).
+    pub nrow: *const c_void,
+    /// `[layers, MK_MLP_HIDDEN]` and `[layers, MK_MLP_INTER]` bf16, the gate/up's and the down's
+    /// quantized rows as e4m3 values, and `[layers, 2]` f32 their scales (`MK_MLP_QUANT_ONCE`).
+    pub qrow: *const c_void,
+    pub qact: *const c_void,
+    pub qscale: *const c_void,
+}
+
 /// The MLP program's per-layer weights ([`mk_mlp_test`]): each a device pointer to all layers'.
 #[derive(Clone, Copy, Debug)]
 pub struct MkMlpWeights {
@@ -2461,6 +2524,106 @@ pub unsafe fn mk_test(
         code,
         KernelError::MkShape {
             dims: [n, counter_count, chain_count, rows],
+        },
+    )
+}
+
+/// Test support for `tests/megakernel.rs` only (FP8 S8 M0-A, the ablation): [`mk_mlp_test`] at
+/// `variant` (0, or one of the six flag sets the kernel instantiates: `NORM_ONCE`, `NORM_ONCE |
+/// QUANT_ONCE`, `NO_WAIT`, `FULL_WAVE`, `NORM_ONCE | QUANT_ONCE | TWO_LANES`, and that with
+/// `FULL_WAVE`), the lists `[workers, n, MK_INSTRUCTION_WIDTH]` (264 workers under `TWO_LANES`, else
+/// 132), the precomputed `rows` the variant reads, and, when `trace` is not null, `[workers, n,
+/// MK_TRACE_WIDTH]` u64 of each instruction's `clock64` stamps. Refused with
+/// [`KernelError::MkShape`] (`[n, counter_count, layers, variant]`) for another variant, a null row
+/// the variant reads, or what [`mk_mlp_test`] refuses. Asynchronous.
+///
+/// # Safety
+///
+/// As [`mk_mlp_test`]'s, and every row and the trace a device pointer to its elements; the trace
+/// overlaps nothing else.
+#[doc(hidden)]
+pub unsafe fn mk_mlp_ablation(
+    (variant, trace): (u32, *mut c_void),
+    (instructions, n): (*const c_void, u32),
+    (counters, counter_count): (*mut c_void, u32),
+    (h, act): (*mut c_void, *mut c_void),
+    (w, rows): (MkMlpWeights, MkMlpRows),
+    (layers, eps, gain_offset): (u32, f32, f32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // variant and the counts before it touches a pointer and catches every C++ exception.
+    let code = unsafe {
+        scratchy_cuda_mk_mlp_ablation(
+            variant,
+            instructions,
+            n,
+            counters,
+            counter_count,
+            h,
+            w.gain,
+            w.gate.0,
+            w.gate.1,
+            w.up.0,
+            w.up.1,
+            w.down.0,
+            w.down.1,
+            act,
+            layers,
+            eps,
+            gain_offset,
+            rows.nrow,
+            rows.qrow,
+            rows.qact,
+            rows.qscale,
+            trace,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::MkShape {
+            dims: [n, counter_count, layers, variant],
+        },
+    )
+}
+
+/// Test support for `tests/megakernel.rs` only (FP8 S8 M0-A): one plain launch of the MLP program's
+/// gate/up body for layer `layer` of `layers`, at 66 CTAs of 32 rows (today's grid) or, with
+/// `full_wave`, 132 of 16: `act[layer] = gelu_tanh_mul(gate(q), up(q))`, `q` the quantized
+/// `nrow[layer]` (`[layers, MK_MLP_HIDDEN]` bf16). Refused with [`KernelError::MkShape`] (`[layer,
+/// layers, 0, 0]`) when `layer` is not below `layers`. Asynchronous.
+///
+/// # Safety
+///
+/// As [`mk_mlp_test`]'s for the gate, up, `nrow` and `act` (`[layers, MK_MLP_INTER]` bf16).
+#[doc(hidden)]
+pub unsafe fn mk_gate_up_plain(
+    full_wave: bool,
+    (gate, up): (Fp8Operand, Fp8Operand),
+    (nrow, act): (*const c_void, *mut c_void),
+    (layers, layer): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the contract above; the launcher checks the layer first.
+    let code = unsafe {
+        scratchy_cuda_mk_gate_up_plain(
+            u32::from(full_wave),
+            gate.0,
+            gate.1,
+            up.0,
+            up.1,
+            nrow,
+            act,
+            layers,
+            layer,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::MkShape {
+            dims: [layer, layers, 0, 0],
         },
     )
 }
