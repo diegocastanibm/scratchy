@@ -49,6 +49,21 @@ unsafe extern "C" {
     // FP8 S3: the per-token quantization and the prefill fp8 GEMM family.
     fn scratchy_cuda_quant_rows_fp8_prepare() -> i32;
     fn scratchy_cuda_quant_row_fp8_one_prepare() -> i32;
+    fn scratchy_cuda_rms_norm_quant_one_prepare() -> i32;
+    fn scratchy_cuda_rms_norm_quant_one(
+        form: u32,
+        x: *const c_void,
+        gain: *const c_void,
+        other: *const c_void,
+        y: *mut c_void,
+        sum: *mut c_void,
+        q: *mut c_void,
+        scale: *mut c_void,
+        cols: u32,
+        eps: f32,
+        gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_quant_row_fp8_one(
         x: *const c_void,
         q: *mut c_void,
@@ -1289,6 +1304,10 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     // FP8 S3: the attribute on every instance of each file, which loads each.
     ("quant_rows_fp8", scratchy_cuda_quant_rows_fp8_prepare),
     ("quant_row_fp8_one", scratchy_cuda_quant_row_fp8_one_prepare),
+    (
+        "rms_norm_quant_one",
+        scratchy_cuda_rms_norm_quant_one_prepare,
+    ),
     ("gemm_fp8", scratchy_cuda_gemm_fp8_prepare),
     ("gemm_narrow_fp8", scratchy_cuda_gemm_narrow_fp8_prepare),
     // FP8 S4: the attribute on every main instance of `gemv_fp8.cu`, and a load of its reduces.
@@ -3679,6 +3698,47 @@ pub unsafe fn quant_row_fp8_one_traced(
 ) -> Result<(), KernelError> {
     // SAFETY: as above; the launcher checks the shape before it touches a pointer.
     let code = unsafe { scratchy_cuda_quant_row_fp8_one_traced(x, q, scale, cols, trace, stream) };
+    check(code, KernelError::RowShape { rows: 1, cols })
+}
+
+/// Test support for `tests/gemv_fp8_tc.rs` only (FP8 S8's T3, no tape launches it yet): one row's
+/// norm form `form` (0 [`rms_norm_bf16`], 2 [`add_rms_norm_bf16`] with `other` its `b` and `sum`
+/// its sum, 3 [`norm_add_bf16`] with `other` its residual) into `y [1, cols]` bf16, those
+/// launchers' bits at one row, and [`quant_rows_fp8`] of `y` into `q [1, cols]` e4m3 and
+/// `scale [1]` f32, its bits; one CTA. Refused with [`KernelError::RowShape`] (`rows` 1) unless
+/// `cols` is a non-zero multiple of 64 at most 5,120 and `form` 0, 2 or 3. Asynchronous.
+///
+/// # Safety
+///
+/// Every pointer is 16-byte-aligned device memory of `cols` elements of its type (`scale` one
+/// f32); an unused `other` or `sum` any such address; no output overlaps an input; `stream` live or
+/// null.
+#[doc(hidden)]
+pub unsafe fn rms_norm_quant_one(
+    form: u32,
+    (x, other, gain): (*const c_void, *const c_void, *const c_void),
+    (y, sum, q, scale): (*mut c_void, *mut c_void, *mut c_void, *mut c_void),
+    cols: u32,
+    (eps, gain_offset): (f32, f32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape and form before it touches a pointer.
+    let code = unsafe {
+        scratchy_cuda_rms_norm_quant_one(
+            form,
+            x,
+            gain,
+            other,
+            y,
+            sum,
+            q,
+            scale,
+            cols,
+            eps,
+            gain_offset,
+            stream,
+        )
+    };
     check(code, KernelError::RowShape { rows: 1, cols })
 }
 

@@ -1124,3 +1124,305 @@ fn the_one_row_quantize_phases_are_recorded() {
         }
     }
 }
+
+// ── T3: the one-row norm + quantize ──────────────────────────────────────────────
+
+/// The norm forms T3 takes, by its launcher's number: `rms_norm_bf16`, `add_rms_norm_bf16`,
+/// `norm_add_bf16`.
+const NORM: u32 = 0;
+const ADD_NORM: u32 = 2;
+const NORM_ADD: u32 = 3;
+const EPS: f32 = 1e-6;
+
+/// One row's operands and outputs for a norm form: `x`, `other` (`b` or the residual), the gain,
+/// and the bf16 `y` and `sum`, the e4m3 `q` and the f32 `scale`.
+struct NormRow {
+    x: DeviceBuffer,
+    other: DeviceBuffer,
+    gain: DeviceBuffer,
+    y: DeviceBuffer,
+    sum: DeviceBuffer,
+    q: DeviceBuffer,
+    scale: DeviceBuffer,
+    cols: u32,
+}
+
+impl NormRow {
+    fn new(device: &CudaDevice, cols: u32, seed: u64) -> Self {
+        let c = cols as usize;
+        let up = |s| DeviceBuffer::upload(device, &bf16_inputs(c, s)).expect("upload");
+        Self {
+            x: up(seed),
+            other: up(seed ^ 0xA1),
+            gain: up(seed ^ 0xB2),
+            y: filled(device, 2 * c, 0xEE),
+            sum: filled(device, 2 * c, 0xEE),
+            q: filled(device, c, 0xEE),
+            scale: filled(device, 4, 0xEE),
+            cols,
+        }
+    }
+
+    /// Today's one-row norm of `form` (the W1 kernels), into `y` (and `sum`), on `stream`.
+    fn w1(&self, form: u32, offset: f32, stream: *mut c_void) {
+        use scratchy_target_cuda::kernels::{add_rms_norm_bf16, norm_add_bf16, rms_norm_bf16};
+        let (x, o, g) = (
+            self.x.ptr().cast_const(),
+            self.other.ptr().cast_const(),
+            self.gain.ptr().cast_const(),
+        );
+        let shape = (1, self.cols);
+        // SAFETY: every buffer holds `cols` bf16 (`scale` one f32), its own allocation; `stream`
+        // is live or null.
+        unsafe {
+            match form {
+                NORM => rms_norm_bf16(x, g, self.y.ptr(), shape, EPS, offset, stream),
+                ADD_NORM => add_rms_norm_bf16(
+                    (x, o),
+                    g,
+                    (self.sum.ptr(), self.y.ptr()),
+                    shape,
+                    (EPS, offset),
+                    stream,
+                ),
+                _ => norm_add_bf16((x, o), g, self.y.ptr(), shape, (EPS, offset), stream),
+            }
+        }
+        .expect("W1 norm launch");
+    }
+
+    /// T3 of `form`, into `y`, `sum`, `q` and `scale`, on `stream`.
+    fn t3(&self, form: u32, offset: f32, stream: *mut c_void) {
+        use scratchy_target_cuda::kernels::rms_norm_quant_one;
+        // SAFETY: as `w1`'s.
+        unsafe {
+            rms_norm_quant_one(
+                form,
+                (
+                    self.x.ptr().cast_const(),
+                    self.other.ptr().cast_const(),
+                    self.gain.ptr().cast_const(),
+                ),
+                (self.y.ptr(), self.sum.ptr(), self.q.ptr(), self.scale.ptr()),
+                self.cols,
+                (EPS, offset),
+                stream,
+            )
+        }
+        .expect("rms_norm_quant_one launch");
+    }
+
+    /// Q1 of `y` into `q` and `scale`, on `stream`.
+    fn q1(&self, stream: *mut c_void) {
+        use scratchy_target_cuda::kernels::quant_row_fp8_one;
+        // SAFETY: as `w1`'s.
+        unsafe {
+            quant_row_fp8_one(
+                self.y.ptr().cast_const(),
+                (self.q.ptr(), self.scale.ptr()),
+                self.cols,
+                stream,
+            )
+        }
+        .expect("quant_row_fp8_one launch");
+    }
+}
+
+fn bytes_of(b: &DeviceBuffer, len: usize) -> Vec<u8> {
+    b.download()
+        .expect("download")
+        .iter()
+        .flat_map(|h| h.to_le_bytes())
+        .take(len)
+        .collect()
+}
+
+/// T3 is today's one-row norm then `quant_rows_fp8`, bit for bit on both outputs: `y` (and
+/// `ADD_NORM`'s sum) are the W1 kernel's, and `q` and the scale are `quant_rows_fp8`'s of that `y`
+/// (its 16-row input, row 0 `y`). The 27B's 5,120, the 35B's 2,048 and Gemma's 2,816 columns, every
+/// form, gain offsets 0 and 1, as `T3_BITS` lines.
+#[test]
+fn the_norm_quantize_is_the_norm_then_quant_rows_fp8_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for cols in [5120u32, 2048, 2816] {
+        let c = cols as usize;
+        for form in [NORM, ADD_NORM, NORM_ADD] {
+            for offset in [0.0f32, 1.0] {
+                let r = NormRow::new(&device, cols, 0x900 ^ u64::from(cols) ^ u64::from(form));
+                r.w1(form, offset, std::ptr::null_mut());
+                let (y_ref, sum_ref) = (r.y.download().expect("y"), r.sum.download().expect("sum"));
+                let act = Act::new(&device, &y_ref[..c]);
+                act.quantize();
+                let (q_ref, s_ref) = (bytes_of(&act.q, c), bytes_of(&act.s, 4));
+                r.t3(form, offset, std::ptr::null_mut());
+                let (y, sum) = (r.y.download().expect("y"), r.sum.download().expect("sum"));
+                let (q, s) = (bytes_of(&r.q, c), bytes_of(&r.scale, 4));
+                let y_bad = mismatched_bits(&y[..c], &y_ref[..c]);
+                let sum_bad = if form == ADD_NORM {
+                    mismatched_bits(&sum[..c], &sum_ref[..c])
+                } else {
+                    0
+                };
+                let q_bad = q.iter().zip(&q_ref).filter(|(a, b)| a != b).count();
+                let ok = y_bad == 0 && sum_bad == 0 && q_bad == 0 && s == s_ref;
+                eprintln!(
+                    "T3_BITS form={form} cols={cols} offset={offset}: y_mismatched={y_bad} \
+                     sum_mismatched={sum_bad} q_mismatched={q_bad} scale_same={} {}",
+                    s == s_ref,
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+    }
+    assert!(pass, "T3 is not the one-row norm then quant_rows_fp8");
+}
+
+/// The forms each model runs at its hidden width: the 27B's and the 35B's AddRmsNorm and RmsNorm,
+/// Gemma's RmsNorm and NormAdd.
+const T3_SHAPES: &[(&str, u32, u32)] = &[
+    ("27B", 5120, ADD_NORM),
+    ("27B", 5120, NORM),
+    ("35B", 2048, ADD_NORM),
+    ("35B", 2048, NORM),
+    ("Gemma", 2816, NORM),
+    ("Gemma", 2816, NORM_ADD),
+];
+
+/// T3's eager time against today's one-row norm and the norm then Q1 (two launches), read-flush
+/// cold and hot, two rounds (A, B, A, B), as `TC_TIME` lines; the gate is T3 ≤ the norm + 2 µs.
+#[test]
+fn the_norm_quantize_times_are_recorded() {
+    let device = h100();
+    let flush = Flush::new(&device);
+    for &(model, cols, form) in T3_SHAPES {
+        let r = NormRow::new(&device, cols, 0x910);
+        let shape = format!("{model}_form{form}_{cols}");
+        let offset = if model == "Gemma" { 1.0 } else { 0.0 };
+        let null = std::ptr::null_mut();
+        for round in 1..=2 {
+            record(&flush, &shape, "w1_norm", round, 2 * cols as usize, || {
+                r.w1(form, offset, null)
+            });
+            record(
+                &flush,
+                &shape,
+                "t3_norm_quant",
+                round,
+                2 * cols as usize,
+                || r.t3(form, offset, null),
+            );
+            record(
+                &flush,
+                &shape,
+                "w1_norm+q1",
+                round,
+                2 * cols as usize,
+                || {
+                    r.w1(form, offset, null);
+                    r.q1(null);
+                },
+            );
+        }
+    }
+}
+
+const STREAM_BLOCKING: u32 = 0;
+const CAPTURE_THREAD_LOCAL: i32 = 1;
+
+unsafe extern "C" {
+    fn cudaStreamCreateWithFlags(stream: *mut *mut c_void, flags: u32) -> i32;
+    fn cudaStreamDestroy(stream: *mut c_void) -> i32;
+    fn cudaStreamBeginCapture(stream: *mut c_void, mode: i32) -> i32;
+    fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> i32;
+    fn cudaGraphInstantiateWithFlags(exec: *mut *mut c_void, graph: *mut c_void, flags: u64)
+    -> i32;
+    fn cudaGraphLaunch(exec: *mut c_void, stream: *mut c_void) -> i32;
+    fn cudaGraphExecDestroy(exec: *mut c_void) -> i32;
+    fn cudaGraphDestroy(graph: *mut c_void) -> i32;
+}
+
+/// `launch(stream)` ten times captured into one graph on a blocking stream, replayed between CUDA
+/// events (the legacy default stream orders them), read-flush cold and hot: one `TC_TIME` line
+/// each, with the replay's time per node.
+fn graph_record(flush: &Flush, shape: &str, imp: &str, round: u32, launch: impl Fn(*mut c_void)) {
+    let (mut stream, mut graph, mut exec) = (
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    );
+    // SAFETY: out-pointers to locals; nothing else is captured on this thread; every handle is
+    // destroyed below.
+    unsafe {
+        assert_eq!(
+            cudaStreamCreateWithFlags(&mut stream, STREAM_BLOCKING),
+            0,
+            "stream"
+        );
+        assert_eq!(
+            cudaStreamBeginCapture(stream, CAPTURE_THREAD_LOCAL),
+            0,
+            "begin capture"
+        );
+        for _ in 0..10 {
+            launch(stream);
+        }
+        assert_eq!(cudaStreamEndCapture(stream, &mut graph), 0, "end capture");
+        assert_eq!(
+            cudaGraphInstantiateWithFlags(&mut exec, graph, 0),
+            0,
+            "instantiate"
+        );
+    }
+    let replay = || {
+        // SAFETY: `exec` is the instantiated graph and `stream` live.
+        assert_eq!(unsafe { cudaGraphLaunch(exec, stream) }, 0, "graph launch");
+    };
+    let cold = timed(|| flush.run(), replay);
+    let hot = timed(|| {}, replay);
+    for (temp, (med, lo, hi)) in [("readcold", cold), ("hot", hot)] {
+        eprintln!(
+            "TC_TIME {temp} {shape} {imp}_graph_per_node: median={:.2}us min={:.2}us max={:.2}us \
+             0.00 TB/s (round {round})",
+            med / 10.0,
+            lo / 10.0,
+            hi / 10.0
+        );
+    }
+    // SAFETY: the handles were created above and are no longer used.
+    unsafe {
+        cudaGraphExecDestroy(exec);
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+    }
+}
+
+/// Inside a captured CUDA graph of 10 back-to-back nodes: today's one-row norm, T3, the norm then Q1
+/// (20 nodes, per pair), and Q1 alone (also at 17,408 columns), read-flush cold and hot, two rounds,
+/// as `TC_TIME … _graph_per_node` lines.
+#[test]
+fn the_norm_quantize_and_q1_graph_times_are_recorded() {
+    let device = h100();
+    let flush = Flush::new(&device);
+    for &(model, cols, form) in T3_SHAPES {
+        let r = NormRow::new(&device, cols, 0x920);
+        let shape = format!("{model}_form{form}_{cols}");
+        let offset = if model == "Gemma" { 1.0 } else { 0.0 };
+        for round in 1..=2 {
+            graph_record(&flush, &shape, "w1_norm", round, |s| r.w1(form, offset, s));
+            graph_record(&flush, &shape, "t3_norm_quant", round, |s| {
+                r.t3(form, offset, s)
+            });
+            graph_record(&flush, &shape, "w1_norm+q1", round, |s| {
+                r.w1(form, offset, s);
+                r.q1(s);
+            });
+            graph_record(&flush, &shape, "q1", round, |s| r.q1(s));
+        }
+    }
+    let r = NormRow::new(&device, 17408, 0x930);
+    for round in 1..=2 {
+        graph_record(&flush, "q1_1x17408", "q1", round, |s| r.q1(s));
+    }
+}
