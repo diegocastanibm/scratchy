@@ -553,6 +553,126 @@ __global__ __launch_bounds__(NUM_THREADS, tc_b8::min_blocks) void gemv_fp8_b8_ke
     }
 }
 
+// ── T4: B8's tuning knobs (FP8 S8, /tmp/a-tc-plan.md §5.5; test-only, no tape launches them) ──
+//
+// `gemv_fp8_b8_tune_ker<EXPERT, F32, CFG>` is `gemv_fp8_b8_ker`'s main loop and epilogue with the
+// ring depth, the CTAs per SM and the schedule as knobs. Each tile's WGMMAs and epilogue are the
+// production kernel's, in the same order, so every instance is its bits. The schedules:
+//   - one CTA per (tile, pair), as `gemv_fp8_b8_ker` (`persistent` false);
+//   - persistent (`persistent` true): `min(units, 132 · min_blocks)` CTAs, CTA `c` taking units
+//     `c, c + grid, …` of the `tiles × pairs` units, its one ring running across them, so the
+//     producer loads the next unit's first stages while the consumer finishes the current one.
+// The instances (24 KB a stage: a 16 KB weight box and an 8 KB activation box):
+//   1 `s8x1`: 8 stages, 1 CTA per SM; 2 `s9x1`: 9 (10 stages need 241 KB, past the SM's 227);
+//   3 `s3x3`: 3 stages, 3 CTAs per SM (2 × 5 stages need 2 × 121 KB, past it too);
+//   4 `p8x1`: persistent, 8 stages, 1 CTA per SM; 5 `p4x2`: persistent, 4 stages, 2 CTAs per SM.
+template <int STAGES_, int MIN_BLOCKS_, bool PERSISTENT_>
+struct b8_tune {
+    static constexpr int stages = STAGES_;
+    static constexpr int min_blocks = MIN_BLOCKS_;
+    static constexpr bool persistent = PERSISTENT_;
+    static constexpr size_t smem = STAGES_ * (sizeof(b8_w_tile) + sizeof(b8_x_tile)) + 1024;
+    static_assert(MIN_BLOCKS_ * smem <= kittens::MAX_SHARED_MEMORY, "the CTAs per SM fit");
+};
+using b8_s8x1 = b8_tune<8, 1, false>;
+using b8_s9x1 = b8_tune<9, 1, false>;
+using b8_s3x3 = b8_tune<3, 3, false>;
+using b8_p8x1 = b8_tune<8, 1, true>;
+using b8_p4x2 = b8_tune<4, 2, true>;
+
+template <bool F32>
+struct b8_tune_globals {
+    b8_globals<F32> g;
+    // Every member's tiles, and `tiles · pairs`.
+    int tiles;
+    int units;
+};
+
+template <bool EXPERT, bool F32, typename CFG>
+__global__ __launch_bounds__(NUM_THREADS, CFG::min_blocks) void gemv_fp8_b8_tune_ker(
+    const __grid_constant__ b8_tune_globals<F32> tg) {
+    using acc32 = rt_fl<16, 32>;
+    constexpr int STAGES = CFG::stages;
+    const b8_globals<F32>& g = tg.g;
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    b8_w_tile(&w_s)[STAGES] = al.allocate<b8_w_tile, STAGES>();
+    b8_x_tile(&x_s)[STAGES] = al.allocate<b8_x_tile, STAGES>();
+    __shared__ semaphore arrived[STAGES], done[STAGES];
+    // This CTA's units: one (its grid cell), or (persistent) every `gridDim.x`-th from `blockIdx.x`.
+    const int first = CFG::persistent ? int(blockIdx.x) : int(blockIdx.y) * tg.tiles + int(blockIdx.x);
+    const int stride = CFG::persistent ? int(gridDim.x) : tg.units;
+    // A unit's tile, pair, member, local tile, activation row and weight depth.
+    const auto unit = [&](int u, int& t, int& p, int& m, int& local, int& xrow, int& depth) {
+        t = u % tg.tiles;
+        p = u / tg.tiles;
+        m = t >= g.start2 ? 2 : t >= g.start1 ? 1 : 0;
+        local = t - (m == 2 ? g.start2 : m == 1 ? g.start1 : 0);
+        xrow = p / g.row_div;
+        depth = 0;
+        if constexpr (EXPERT) {
+            depth = g.topk_idx[{0, 0, 0, p}];
+        }
+    };
+    if (threadIdx.x == 0) {
+        for (int s = 0; s < STAGES; s++) {
+            init_semaphore(arrived[s], 0, 1);
+            init_semaphore(done[s], 1, 0);
+        }
+    }
+    __syncthreads();
+    if (warpgroup::groupid() == 1) {
+        if (warpgroup::warpid() == 0) {
+            int it = 0;
+            for (int u = first; u < tg.units; u += stride) {
+                int t, p, m, local, xrow, depth;
+                unit(u, t, p, m, local, xrow, depth);
+                const b8_w_gl& b = m == 2 ? g.b2 : m == 1 ? g.b1 : g.b0;
+                for (int j = 0; j < g.k_steps; j++, it++) {
+                    const int s = it % STAGES;
+                    if (it >= STAGES) {
+                        wait(done[s], ((it - STAGES) / STAGES) % 2);
+                    }
+                    warp::tma::expect_bytes(arrived[s], sizeof(b8_x_tile) + sizeof(b8_w_tile));
+                    warp::tma::load_async(x_s[s], g.x, {0, xrow, 0, j}, arrived[s]);
+                    warp::tma::load_async(w_s[s], b, {0, depth, local, j}, arrived[s]);
+                }
+            }
+        }
+    } else {
+        int it = 0;
+        for (int u = first; u < tg.units; u += stride) {
+            int t, p, m, local, xrow, depth;
+            unit(u, t, p, m, local, xrow, depth);
+            acc32 acc;
+            warp::zero(acc);
+            for (int j = 0; j < g.k_steps; j++, it++) {
+                const int s = it % STAGES;
+                wait(arrived[s], (it / STAGES) % 2);
+                warpgroup::mma_ABt(acc, w_s[s], x_s[s]);
+                warpgroup::mma_async_wait();
+                if (warpgroup::laneid() == 0) {
+                    arrive(done[s], 1);
+                }
+            }
+            // `gemv_fp8_b8_ker`'s epilogue.
+            const int w = warpgroup::warpid();
+            const int row = local * tc_b8::tile + 16 * w;
+            typename acc32::col_vec v, side;
+            warp::row_sum(v, acc);
+            warp::load(side, m == 2 ? g.s2 : m == 1 ? g.s1 : g.s0, {0, 0, depth, row / 16});
+            warp::mul(v, v, side);
+            warp::mul(v, v, g.a_scale[{0, 0, 0, xrow}]);
+            if (g.add) {
+                warp::unary_op<scratchy::ops::round_bf16>(v, v);
+                warp::load(side, m == 2 ? g.r2 : m == 1 ? g.r1 : g.r0, {0, 0, p, row / 16});
+                warp::add(v, v, side);
+            }
+            warp::store(m == 2 ? g.c2 : m == 1 ? g.c1 : g.c0, v, {0, 0, p, row / 16});
+        }
+    }
+}
+
 // The swizzled-box probe (test support, `tests/gemv_fp8_b8.rs`, TK-1's R1 on B8's 128-byte-swizzled
 // fp8 boxes): each box first TMA-loaded with all-NaN `poison`, then B8's own box at K step `j`,
 // activation row `row` (the `[rows, 1, k]` view) and weight tile `tile`, then both TMA-stored to
@@ -696,6 +816,92 @@ bool b8_refused(const b8_args& a, bool f32) {
         }
     }
     return false;
+}
+
+// T4: `launch_b8`'s views (copied, so the production launch stays as it is), then the tuning
+// instance `CFG`'s launch on `stream`. Can throw (TK's host code).
+template <bool EXPERT, bool F32, typename CFG>
+int launch_b8_tune(const b8_args& a, void* stream) {
+    using out_t = std::conditional_t<F32, float, bf16>;
+    const uint32_t last = a.count - 1;
+    const auto at = [&](uint32_t i) { return i < a.count ? i : last; };
+    const auto rows = [&](uint32_t i) { return EXPERT ? a.expert_rows : a.n[at(i)]; };
+    const auto wv = [&](uint32_t i) {
+        return b8_w_gl{static_cast<fp8e4m3*>(const_cast<void*>(a.b[at(i)])), nullptr,
+                       size_t(a.experts), size_t(rows(i)), size_t(a.k)};
+    };
+    const auto sv = [&](uint32_t i) {
+        return b8_scale_gl{static_cast<float*>(const_cast<void*>(a.b_scale[at(i)])), nullptr,
+                           nullptr, size_t(a.experts), size_t(rows(i))};
+    };
+    const auto cv = [&](uint32_t i) {
+        return b8_out_gl<F32>{static_cast<out_t*>(a.c[at(i)]), nullptr, nullptr,
+                              size_t(a.pairs), size_t(a.n[at(i)])};
+    };
+    const auto rv = [&](uint32_t i) {
+        const void* r = a.residual != nullptr ? a.residual[at(i)] : a.c[at(i)];
+        return b8_res_gl{static_cast<bf16*>(const_cast<void*>(r)), nullptr, nullptr,
+                         size_t(a.pairs), size_t(a.n[at(i)])};
+    };
+    int tiles[3] = {0, 0, 0};
+    for (uint32_t i = 0; i < a.count; i++) {
+        tiles[i] = tiles_of(a.n[i], tc_b8::tile);
+    }
+    const int all = tiles[0] + tiles[1] + tiles[2];
+    const void* idx = EXPERT ? a.topk_idx : a.a_scale;
+    const int units = all * int(a.pairs);
+    b8_tune_globals<F32> G{
+        b8_globals<F32>{
+            b8_x_gl{static_cast<fp8e4m3*>(const_cast<void*>(a.q)), nullptr, size_t(a.a_rows),
+                    nullptr, size_t(a.k)},
+            b8_ascale_gl{static_cast<float*>(const_cast<void*>(a.a_scale)), nullptr, nullptr,
+                         nullptr, size_t(a.a_rows)},
+            wv(0), wv(1), wv(2),
+            sv(0), sv(1), sv(2),
+            cv(0), cv(1), cv(2),
+            rv(0), rv(1), rv(2),
+            b8_idx_gl{static_cast<int*>(const_cast<void*>(idx)), nullptr, nullptr, nullptr,
+                      size_t(EXPERT ? a.pairs : 1)},
+            a.count > 1 ? tiles[0] : all,
+            a.count > 2 ? tiles[0] + tiles[1] : all,
+            int((a.k + uint32_t(tc_b8::k_step) - 1) / uint32_t(tc_b8::k_step)),
+            int(a.row_div),
+            a.residual != nullptr ? 1 : 0},
+        all,
+        units};
+    void* args[] = {&G};
+    const int slots = CTAS * CFG::min_blocks;
+    const dim3 grid = CFG::persistent ? dim3(uint32_t(units < slots ? units : slots))
+                                      : dim3(uint32_t(all), a.pairs);
+    return static_cast<int>(cudaLaunchKernel(gemv_fp8_b8_tune_ker<EXPERT, F32, CFG>, grid,
+                                             dim3(uint32_t(NUM_THREADS)), args, CFG::smem,
+                                             static_cast<cudaStream_t>(stream)));
+}
+
+template <bool EXPERT, bool F32, typename CFG>
+cudaError_t allow_b8_tune() {
+    return cudaFuncSetAttribute(gemv_fp8_b8_tune_ker<EXPERT, F32, CFG>,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize, int(CFG::smem));
+}
+
+// Every form of instance `CFG`.
+template <typename CFG>
+cudaError_t allow_b8_tune_all() {
+    cudaError_t e = allow_b8_tune<false, false, CFG>();
+    e = e != cudaSuccess ? e : allow_b8_tune<false, true, CFG>();
+    e = e != cudaSuccess ? e : allow_b8_tune<true, false, CFG>();
+    return e != cudaSuccess ? e : allow_b8_tune<true, true, CFG>();
+}
+
+template <typename CFG>
+int launch_b8_tune_any(const b8_args& a, bool f32, void* stream) {
+    const bool expert = a.topk_idx != nullptr;
+    if (f32) {
+        return expert ? launch_b8_tune<true, true, CFG>(a, stream)
+                      : launch_b8_tune<false, true, CFG>(a, stream);
+    }
+    return expert ? launch_b8_tune<true, false, CFG>(a, stream)
+                  : launch_b8_tune<false, false, CFG>(a, stream);
 }
 
 }  // namespace
@@ -862,6 +1068,54 @@ extern "C" int scratchy_cuda_gemv_fp8_b8_box_probe(const void* x, uint32_t rows,
         const dim3 grid{1u}, block{uint32_t(kittens::WARP_THREADS)};
         return static_cast<int>(cudaLaunchKernel(gemv_fp8_b8_box_probe_ker, grid, block, args,
                                                  B8_PROBE_SMEM, static_cast<cudaStream_t>(stream)));
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}
+
+// T4's one-time setup: allow every tuning instance its dynamic shared memory (in `PREPARE`).
+// 0 = done; any other value = the first failing cudaError_t.
+extern "C" int scratchy_cuda_gemv_fp8_b8_tune_prepare(void) {
+    cudaError_t e = cudaSuccess;
+    for (const cudaError_t r : {allow_b8_tune_all<b8_s8x1>(), allow_b8_tune_all<b8_s9x1>(),
+                                allow_b8_tune_all<b8_s3x3>(), allow_b8_tune_all<b8_p8x1>(),
+                                allow_b8_tune_all<b8_p4x2>()}) {
+        if (e == cudaSuccess) {
+            e = r;
+        }
+    }
+    return static_cast<int>(e);
+}
+
+// Test support (`tests/gemv_fp8_b8.rs`, T4): `scratchy_cuda_gemv_fp8_b8` at `variant`: 0 the
+// production kernel itself; 1 `s8x1`, 2 `s9x1`, 3 `s3x3`, 4 `p8x1`, 5 `p4x2` (`b8_tune`'s
+// instances), each the production bits. The same arguments and refusals, and `variant` at most 5.
+extern "C" int scratchy_cuda_gemv_fp8_b8_variant(
+    const void* q, const void* a_scale, uint32_t a_rows, const void* const* b,
+    const void* const* b_scale, void* const* c, const void* const* residual, const uint32_t* n,
+    uint32_t count, uint32_t k, uint32_t experts, uint32_t expert_rows, const void* topk_idx,
+    uint32_t pairs, uint32_t row_div, uint32_t out_f32, uint32_t variant,
+    void* stream /* cudaStream_t; null = default */) {
+    if (variant == 0) {
+        return scratchy_cuda_gemv_fp8_b8(q, a_scale, a_rows, b, b_scale, c, residual, n, count, k,
+                                         experts, expert_rows, topk_idx, pairs, row_div, out_f32,
+                                         stream);
+    }
+    const b8_args a{q,     a_scale, a_rows, b,           b_scale,  c,     residual, n,
+                    count, k,       experts, expert_rows, topk_idx, pairs, row_div};
+    const bool f32 = out_f32 != 0;
+    if (b8_refused(a, f32) || variant > 5) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        switch (variant) {
+            case 1: return launch_b8_tune_any<b8_s8x1>(a, f32, stream);
+            case 2: return launch_b8_tune_any<b8_s9x1>(a, f32, stream);
+            case 3: return launch_b8_tune_any<b8_s3x3>(a, f32, stream);
+            case 4: return launch_b8_tune_any<b8_p8x1>(a, f32, stream);
+            default: return launch_b8_tune_any<b8_p4x2>(a, f32, stream);
+        }
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }

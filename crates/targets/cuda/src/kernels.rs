@@ -200,6 +200,27 @@ unsafe extern "C" {
         out_f32: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gemv_fp8_b8_tune_prepare() -> i32;
+    fn scratchy_cuda_gemv_fp8_b8_variant(
+        q: *const c_void,
+        a_scale: *const c_void,
+        a_rows: u32,
+        b: *const *const c_void,
+        b_scale: *const *const c_void,
+        c: *const *mut c_void,
+        residual: *const *const c_void,
+        n: *const u32,
+        count: u32,
+        k: u32,
+        experts: u32,
+        expert_rows: u32,
+        topk_idx: *const c_void,
+        pairs: u32,
+        row_div: u32,
+        out_f32: u32,
+        variant: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gemv_fp8_b8_box_probe(
         x: *const c_void,
         rows: u32,
@@ -1341,6 +1362,7 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     // FP8 S4: the attribute on every main instance of `gemv_fp8.cu`, and a load of its reduces.
     ("gemv_fp8", scratchy_cuda_gemv_fp8_prepare),
     ("gemv_fp8_tc", scratchy_cuda_gemv_fp8_tc_prepare),
+    ("gemv_fp8_b8_tune", scratchy_cuda_gemv_fp8_b8_tune_prepare),
     ("act_quant_fp8", scratchy_cuda_act_quant_fp8_prepare),
     // Load-only (#1048): these set no attribute, but a worker captures its tapes into CUDA Graphs
     // at construction, and a kernel the runtime has not loaded must not first load during a
@@ -4189,6 +4211,79 @@ pub unsafe fn gemv_fp8_b8(
             pairs,
             row_div,
             u32::from(out_f32),
+            stream,
+        )
+    };
+    check(code, refused)
+}
+
+/// Test support for `tests/gemv_fp8_b8.rs` only (FP8 S8 T4): [`gemv_fp8_b8`] at `variant`, 0 the
+/// production kernel itself, 1 to 5 its tuning instances (`kernels/gemv_fp8_tc.cu`'s `b8_tune`:
+/// 8 stages × 1 CTA per SM, 9 × 1, 3 × 3, persistent 8 × 1, persistent 4 × 2), each the production
+/// bits. Refused as [`gemv_fp8_b8`], or for `variant` above 5. Asynchronous.
+///
+/// # Safety
+///
+/// As [`gemv_fp8_b8`]'s.
+#[doc(hidden)]
+pub unsafe fn gemv_fp8_b8_variant(
+    (q, a_scale, a_rows): (*const c_void, *const c_void, u32),
+    members: Fp8GroupOperands<'_>,
+    k: u32,
+    (pairs, row_div, experts): (u32, u32, Option<B8Experts>),
+    store: B8Store<'_>,
+    variant: u32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    let ([b, s], c, n, _) = fp8_group_parts("gemv_fp8_b8_variant", members, (pairs, k));
+    let refused = KernelError::GroupShape {
+        kernel: "gemv_fp8_b8_variant",
+        m: pairs,
+        k,
+        n,
+    };
+    let (residual, out_f32) = match store {
+        B8Store::Bf16 { residual } => (residual, false),
+        B8Store::F32 => (None, true),
+    };
+    if members.is_empty() || members.len() > 3 || residual.is_some_and(|r| r.len() != members.len())
+    {
+        return Err(refused);
+    }
+    let mut r = [std::ptr::null(); 3];
+    for (slot, &p) in r.iter_mut().zip(residual.unwrap_or(&[])) {
+        *slot = p;
+    }
+    let e = experts.unwrap_or(B8Experts {
+        topk_idx: std::ptr::null(),
+        experts: 1,
+        expert_rows: 0,
+    });
+    // SAFETY: as above; the arrays are three long and the launcher checks the count, every shape
+    // and every null before it reads a pointer.
+    let code = unsafe {
+        scratchy_cuda_gemv_fp8_b8_variant(
+            q,
+            a_scale,
+            a_rows,
+            b.as_ptr(),
+            s.as_ptr(),
+            c.as_ptr(),
+            if residual.is_some() {
+                r.as_ptr()
+            } else {
+                std::ptr::null()
+            },
+            n.as_ptr(),
+            members.len() as u32,
+            k,
+            e.experts,
+            e.expert_rows,
+            e.topk_idx,
+            pairs,
+            row_div,
+            u32::from(out_f32),
+            variant,
             stream,
         )
     };

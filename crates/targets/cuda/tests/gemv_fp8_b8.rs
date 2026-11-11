@@ -1258,3 +1258,128 @@ fn the_b8_inventory_table_is_recorded() {
         }
     }
 }
+
+// ── FP8 S8 T4: B8's tuning knobs ─────────────────────────────────────────────────
+
+/// The tuning instances, by `gemv_fp8_b8_variant`'s number (0 the production kernel).
+const T4_VARIANTS: &[(u32, &str)] = &[
+    (0, "v0_prod_s4x2"),
+    (1, "v1_s8x1"),
+    (2, "v2_s9x1"),
+    (3, "v3_s3x3"),
+    (4, "v4_persistent_s8x1"),
+    (5, "v5_persistent_s4x2"),
+];
+
+/// T4's shapes: the inventory's big rows (the 27B's gate+up, down, o, GDN group and attention
+/// group; the 35B's routed experts; Gemma's dense and routed MLP).
+const T4_SHAPES: &[&str] = &[
+    "27B_gate+up",
+    "27B_down",
+    "27B_gdn_out+attn_o",
+    "27B_gdn_qkv+z",
+    "27B_attn_qkv",
+    "35B_expert_gate+up",
+    "35B_expert_down",
+    "Gemma_gate+up",
+    "Gemma_down",
+    "Gemma_expert_gate+up",
+    "Gemma_expert_down",
+];
+
+fn t4_shapes() -> impl Iterator<Item = (usize, Shape)> {
+    (INVENTORY.iter().enumerate())
+        .filter(|(_, s)| T4_SHAPES.contains(&s.name))
+        .map(|(i, &s)| (i, s))
+}
+
+impl Case {
+    /// [`Case::b8`] at tuning `variant`, every member, bf16 rows with no residual.
+    fn b8_variant(&self, outs: &[DeviceBuffer], variant: u32) {
+        use scratchy_target_cuda::kernels::gemv_fp8_b8_variant;
+        let ops: Vec<(Fp8Operand, *mut c_void, u32)> = (0..self.s.ns.len())
+            .map(|i| (self.weight(i), outs[i].ptr(), self.s.ns[i]))
+            .collect();
+        // SAFETY: as `b8`'s.
+        unsafe {
+            gemv_fp8_b8_variant(
+                (
+                    self.q.ptr().cast_const(),
+                    self.a_scale.ptr().cast_const(),
+                    self.s.a_rows(),
+                ),
+                &ops,
+                self.s.k,
+                (self.s.pairs(), self.s.row_div(), self.experts()),
+                B8Store::Bf16 { residual: None },
+                variant,
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("gemv_fp8_b8_variant launch");
+    }
+}
+
+/// T4: every tuning instance is the production kernel's bits (each tile's WGMMAs and epilogue in
+/// the same order) and inside S3's f64 bound, at T4's shapes, as `T4_BITS` lines.
+#[test]
+fn the_b8_tuning_variants_are_b8_bit_for_bit_and_inside_s3_s_bound() {
+    let device = h100();
+    let mut pass = true;
+    for (case, s) in t4_shapes() {
+        let c = Case::new(&device, s, 0x74C0 ^ (case as u64) << 32);
+        let prod = c.outputs(&device, false);
+        c.b8_variant(&prod, 0);
+        let want: Vec<Vec<u16>> = (prod.iter().zip(s.ns))
+            .map(|(o, &n)| o.download().expect("download")[..(s.pairs() * n) as usize].to_vec())
+            .collect();
+        for &(v, name) in T4_VARIANTS {
+            let outs = c.outputs(&device, false);
+            c.b8_variant(&outs, v);
+            for (i, o) in outs.iter().enumerate() {
+                let got = &o.download().expect("download")[..want[i].len()];
+                let bad_bits = mismatched_bits(got, &want[i]);
+                let (bad, worst) = compare(&bf16_values(got), &c.reference(i));
+                let ok = bad_bits == 0 && bad == 0;
+                eprintln!(
+                    "T4_BITS {name} {} member {i}: mismatched_bits_vs_prod={bad_bits} \
+                     out_of_bound={bad} worst_ratio={worst:.3} {}",
+                    s.name,
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+    }
+    assert!(
+        pass,
+        "a B8 tuning instance differs from the production kernel or is out of bound"
+    );
+}
+
+/// T4's times: every tuning instance at T4's shapes, read-cold (the read flush before each launch)
+/// and hot, two rounds (each instance in turn, so A, B, A, B), as `TC_TIME` lines in TB/s of the
+/// weight bytes. vLLM's per-layer times (the cap pod's nsys, 27B): gate+up 63.4 µs, down 33.9, GDN
+/// qkv+z 30.8.
+#[test]
+fn the_b8_tuning_variants_times_are_recorded() {
+    let device = h100();
+    let flush = Flush::new(&device);
+    for (case, s) in t4_shapes() {
+        let c = Case::new(&device, s, 0x74D0 ^ (case as u64) << 32);
+        let outs = c.outputs(&device, false);
+        for round in 1..=2 {
+            for &(v, name) in T4_VARIANTS {
+                let cold = timed(|| flush.run(), || c.b8_variant(&outs, v));
+                let hot = timed(|| {}, || c.b8_variant(&outs, v));
+                for (temp, us) in [("readcold", cold), ("hot", hot)] {
+                    eprintln!(
+                        "TC_TIME {temp} {} {name}: median={us:.1}us min=0 max=0 {:.2} TB/s (round {round})",
+                        s.name,
+                        s.weight_bytes() as f64 / us / 1e6
+                    );
+                }
+            }
+        }
+    }
+}
