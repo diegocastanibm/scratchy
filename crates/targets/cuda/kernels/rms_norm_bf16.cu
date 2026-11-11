@@ -554,3 +554,291 @@ extern "C" int scratchy_cuda_norm_add_bf16(const void* x, const void* gain, cons
         return SCRATCHY_CUDA_ERR_HOST;
     }
 }
+
+// ── T3: the one-row norm + quantize (FP8 S8, test-only: no tape launches it yet) ──
+//
+// One CTA of the one-row form's 4 warps computes a norm form (`NORM`, `ADD_NORM`, `NORM_ADD`) of
+// one row and quantizes its bf16 output as `quant_rows_fp8` does, with both outputs bit-identical:
+//   - The row (and `b` or the residual, and the gain) is TMA-loaded once into shared memory as
+//     `sv_bf<256>` chunks, in one burst on one semaphore (the columns past `cols` read zeros, as
+//     the one-row form's tiles do).
+//   - Pass 1 is the one-row form's, in its order: warp `w` takes tiles `w, w + 4, …`; each tile's
+//     chunk is copied into row 0 of the warp's scratch `st_bf<16, 256>` (rows 1..15 are never read
+//     into row 0's values: every op here is per row) and the same `warp::load`, `warp::add` and
+//     `round_bf16`, `warp::mul`, `warp::row_sum` follow; then the four sums in warp order and
+//     `rms_inv_fused`, as there. So `inv` is the one-row form's.
+//   - Pass 2 runs the one-row form's pass-2 body on every tile, each warp its tiles, from shared
+//     memory (not a TMA round trip a tile): the same ops in the same order, `warp::store`'s one
+//     rounding into the scratch tile, whose row 0 is copied into the output chunk (`ADD_NORM`'s
+//     sum likewise).
+//   - Then Q1's quantize of that bf16 row: the 4 warps' amax (exact in any order), `fp8_scale`,
+//     and one element a thread, `fp8_quant_pre` then TK's scalar e4m3 convertor.
+//   - The outputs leave by vector TMA stores (bounded by `cols`).
+// `cols` at most 5,120 (20 chunks), a multiple of 64 (`quant_rows_fp8`'s rule).
+
+namespace {
+
+constexpr int NQ_TILES = 20;
+constexpr uint32_t NQ_COL_MULTIPLE = 64;
+
+using nq_chunk = sv_bf<COLS>;
+using nq_q_chunk = sv_fp8e4m3<COLS>;
+using nq_chunk_rv = rv_fl<COLS>;
+using nq_x_gl = gl<bf16, 1, 1, -1, -1, nq_chunk>;
+using nq_q_gl = gl<fp8e4m3, 1, 1, -1, -1, nq_q_chunk>;
+using nq_scale_gl = gl<float, 1, 1, 1, -1>;
+
+struct nq_globals {
+    nq_x_gl x;
+    g_gl gain;
+    nq_x_gl other;
+    nq_x_gl y;
+    nq_x_gl sum;
+    nq_q_gl q;
+    nq_scale_gl scale;
+    int col_tiles;
+    int cols;
+    float fcols;
+    float eps;
+    float gain_offset;
+};
+
+constexpr size_t NQ_SMEM_USED = size_t(NQ_TILES) * (5 * sizeof(nq_chunk) + sizeof(nq_q_chunk)) +
+                                size_t(WARPS) * 3 * sizeof(tile) + WARPS * sizeof(sums_vec);
+constexpr int NQ_SMEM_BYTES = int(NQ_SMEM_USED) + 1024;
+static_assert(NQ_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
+
+// Copy chunk `c` into row 0 of tile `t`, or row 0 of `t` into `c`: one warp, 8 elements a lane.
+__device__ inline void chunk_to_row(tile& t, const nq_chunk& c) {
+    for (int e = warp::laneid(); e < COLS; e += kittens::WARP_THREADS) {
+        t[{0, e}] = c[e];
+    }
+}
+__device__ inline void row_to_chunk(nq_chunk& c, const tile& t) {
+    for (int e = warp::laneid(); e < COLS; e += kittens::WARP_THREADS) {
+        c[e] = t[{0, e}];
+    }
+}
+
+template <int FORM>
+__global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_quant_one_ker(
+    const __grid_constant__ nq_globals g) {
+    constexpr bool GAIN = FORM != UNIT;
+    constexpr bool OTHER = FORM == ADD_NORM || FORM == NORM_ADD;
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    nq_chunk(&xc)[NQ_TILES] = al.allocate<nq_chunk, NQ_TILES>();
+    nq_chunk(&oc)[NQ_TILES] = al.allocate<nq_chunk, NQ_TILES>();
+    gain_vec(&gc)[NQ_TILES] = al.allocate<gain_vec, NQ_TILES>();
+    nq_chunk(&yc)[NQ_TILES] = al.allocate<nq_chunk, NQ_TILES>();
+    nq_chunk(&sc)[NQ_TILES] = al.allocate<nq_chunk, NQ_TILES>();
+    nq_q_chunk(&qc)[NQ_TILES] = al.allocate<nq_q_chunk, NQ_TILES>();
+    tile(&tx)[WARPS] = al.allocate<tile, WARPS>();
+    tile(&to)[WARPS] = al.allocate<tile, WARPS>();
+    tile(&ty)[WARPS] = al.allocate<tile, WARPS>();
+    sums_vec(&sums)[WARPS] = al.allocate<sums_vec, WARPS>();
+    __shared__ kittens::semaphore loaded;
+    __shared__ sv_fl<16> amax_s;
+    const int w = kittens::warpid();
+    const int tiles = g.col_tiles;
+    if (threadIdx.x == 0) {
+        init_semaphore(loaded, 0, 1);
+    }
+    __syncthreads();
+    if (w == 0) {
+        const uint32_t per = uint32_t(sizeof(nq_chunk)) * (1 + (OTHER ? 1 : 0) + (GAIN ? 1 : 0));
+        warp::tma::expect_bytes(loaded, uint32_t(tiles) * per);
+        for (int t = 0; t < tiles; t++) {
+            warp::tma::load_async(xc[t], g.x, {0, 0, 0, t}, loaded);
+            if constexpr (OTHER) {
+                warp::tma::load_async(oc[t], g.other, {0, 0, 0, t}, loaded);
+            }
+            if constexpr (GAIN) {
+                warp::tma::load_async(gc[t], g.gain, {0, 0, 0, t}, loaded);
+            }
+        }
+    }
+    wait(loaded, 0);
+    // Pass 1: the one-row form's sums of squares, its tiles and order.
+    row_values part;
+    warp::zero(part);
+    for (int t = w; t < tiles; t += WARPS) {
+        chunk_to_row(tx[w], xc[t]);
+        if constexpr (FORM == ADD_NORM) {
+            chunk_to_row(to[w], oc[t]);
+        }
+        __syncwarp();
+        acc_tile x;
+        warp::load(x, tx[w]);
+        if constexpr (FORM == ADD_NORM) {
+            acc_tile b;
+            warp::load(b, to[w]);
+            warp::add(x, x, b);
+            round_bf16(x);
+        }
+        warp::mul(x, x, x);
+        warp::row_sum(part, x, part);
+        // Every lane has read the scratch tiles before the next tile's copy overwrites them.
+        __syncwarp();
+    }
+    warp::store(sums[w], part);
+    warpgroup::sync(SUMS_BARRIER);
+    row_values total, other;
+    warp::load(total, sums[0]);
+    for (int v = 1; v < WARPS; v++) {
+        warp::load(other, sums[v]);
+        warp::add(total, total, other);
+    }
+    row_values rcp, inv;
+    warp::one(rcp);
+    warp::div(rcp, rcp, g.fcols);
+    scratchy::ops::rv_ternary_map<scratchy::ops::rms_inv_fused>(inv, total, rcp, g.eps);
+    // Pass 2: the one-row form's pass-2 body on each of this warp's tiles.
+    for (int t = w; t < tiles; t += WARPS) {
+        chunk_to_row(tx[w], xc[t]);
+        if constexpr (OTHER) {
+            chunk_to_row(to[w], oc[t]);
+        }
+        __syncwarp();
+        acc_tile x;
+        warp::load(x, tx[w]);
+        if constexpr (FORM == ADD_NORM) {
+            acc_tile b;
+            warp::load(b, to[w]);
+            warp::add(x, x, b);
+            round_bf16(x);
+            warp::store(ty[w], x);
+            __syncwarp();
+            row_to_chunk(sc[t], ty[w]);
+            __syncwarp();
+        }
+        warp::mul_row(x, x, inv);
+        if constexpr (GAIN) {
+            col_values gain;
+            warp::load(gain, gc[t]);
+            warp::add(gain, gain, g.gain_offset);
+            warp::mul_col(x, x, gain);
+        }
+        if constexpr (FORM == NORM_ADD) {
+            acc_tile r;
+            round_bf16(x);
+            warp::load(r, to[w]);
+            warp::add(x, x, r);
+        }
+        warp::store(ty[w], x);
+        __syncwarp();
+        row_to_chunk(yc[t], ty[w]);
+        __syncwarp();
+    }
+    // The bf16 row is whole before its amax.
+    warpgroup::sync(SUMS_BARRIER);
+    nq_chunk_rv v, m;
+    warp::zero(m);
+    for (int t = w; t < tiles; t += WARPS) {
+        warp::load(v, yc[t]);
+        warp::abs(v, v);
+        warp::max(m, m, v);
+    }
+    const float mx = warp::max(m);
+    if (warp::laneid() == 0) {
+        for (int j = 0; j < 16; j += WARPS) {
+            amax_s[w + j] = mx;
+        }
+    }
+    warpgroup::sync(SUMS_BARRIER);
+    rv_fl<16> all;
+    warp::load(all, amax_s);
+    const float scale = scratchy::ops::fp8_scale::op<float>(warp::max(all));
+    for (int c = int(threadIdx.x); c < g.cols; c += NUM_THREADS) {
+        const float y = base_types::convertor<float, bf16>::convert(yc[c / COLS][c % COLS]);
+        qc[c / COLS][c % COLS] = base_types::convertor<fp8e4m3, float>::convert(
+            scratchy::ops::fp8_quant_pre::op<float>(y, scale));
+    }
+    // Every output chunk is written before warp 0's TMA stores read them (TK's store fences).
+    warpgroup::sync(SUMS_BARRIER);
+    if (w == 0) {
+        if (warp::laneid() == 0) {
+            g.scale[{0, 0, 0, 0}] = scale;
+        }
+        for (int t = 0; t < tiles; t++) {
+            warp::tma::store_async(g.y, yc[t], {0, 0, 0, t});
+            if constexpr (FORM == ADD_NORM) {
+                warp::tma::store_async(g.sum, sc[t], {0, 0, 0, t});
+            }
+            warp::tma::store_async(g.q, qc[t], {0, 0, 0, t});
+        }
+        warp::tma::store_async_wait();
+    }
+}
+
+template <int FORM>
+int launch_nq(const void* x, const void* gain, const void* other, void* y, void* sum, void* q,
+              void* scale, uint32_t cols, float eps, float gain_offset, cudaStream_t stream) {
+    const auto view = [&](const void* p) {
+        return nq_x_gl{static_cast<bf16*>(const_cast<void*>(p)), nullptr, nullptr, size_t(1),
+                       size_t(cols)};
+    };
+    g_gl gg{static_cast<bf16*>(const_cast<void*>(gain)), nullptr, nullptr, nullptr, size_t(cols)};
+    const int col_tiles = int((cols + uint32_t(COLS) - 1) / uint32_t(COLS));
+    nq_globals G{view(x),
+                 gg,
+                 view(other),
+                 view(y),
+                 view(sum),
+                 nq_q_gl{static_cast<fp8e4m3*>(q), nullptr, nullptr, size_t(1), size_t(cols)},
+                 nq_scale_gl{static_cast<float*>(scale), nullptr, nullptr, nullptr, size_t(1)},
+                 col_tiles,
+                 int(cols),
+                 float(cols),
+                 eps,
+                 gain_offset};
+    void* args[] = {&G};
+    return static_cast<int>(cudaLaunchKernel(rms_norm_quant_one_ker<FORM>, dim3(1),
+                                             dim3(NUM_THREADS), args, NQ_SMEM_BYTES, stream));
+}
+
+}  // namespace
+
+// T3's one-time setup: allow its three forms `NQ_SMEM_BYTES` of dynamic shared memory (in
+// `PREPARE`). 0 = done; any other value = the first failing cudaError_t.
+extern "C" int scratchy_cuda_rms_norm_quant_one_prepare(void) {
+    for (auto ker : {rms_norm_quant_one_ker<NORM>, rms_norm_quant_one_ker<ADD_NORM>,
+                     rms_norm_quant_one_ker<NORM_ADD>}) {
+        const cudaError_t e =
+            cudaFuncSetAttribute(ker, cudaFuncAttributeMaxDynamicSharedMemorySize, NQ_SMEM_BYTES);
+        if (e != cudaSuccess) {
+            return static_cast<int>(e);
+        }
+    }
+    return 0;
+}
+
+// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = refused, nothing launched; SCRATCHY_CUDA_ERR_HOST = a
+// C++ exception was caught; any other value = the cudaError_t of the launch.
+//
+// One row of form `form` (0 `scratchy_cuda_rms_norm_bf16`, 2 `scratchy_cuda_add_rms_norm_bf16`
+// with `other` its `b` and `sum` its sum, 3 `scratchy_cuda_norm_add_bf16` with `other` its
+// residual) into `y [1, cols]` bf16, those launchers' bits at `rows` 1, and `quant_rows_fp8` of `y`
+// into `q [1, cols]` e4m3 and `scale [1]` f32, its bits. `cols` a non-zero multiple of 64 at most
+// 5,120 and `form` 0, 2 or 3, checked first; an unused `other` or `sum` may be any valid address of
+// `cols` bf16. Pointers 16-byte aligned, outputs overlapping no input.
+// `scratchy_cuda_rms_norm_quant_one_prepare` must have succeeded. Asynchronous on `stream`.
+extern "C" int scratchy_cuda_rms_norm_quant_one(uint32_t form, const void* x, const void* gain,
+                                                const void* other, void* y, void* sum, void* q,
+                                                void* scale, uint32_t cols, float eps,
+                                                float gain_offset,
+                                                void* stream /* cudaStream_t; null = default */) {
+    if (cols == 0 || cols % NQ_COL_MULTIPLE != 0 || cols > uint32_t(NQ_TILES * COLS) ||
+        (form != NORM && form != ADD_NORM && form != NORM_ADD)) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        const cudaStream_t st = static_cast<cudaStream_t>(stream);
+        return form == NORM       ? launch_nq<NORM>(x, gain, other, y, sum, q, scale, cols, eps, gain_offset, st)
+               : form == ADD_NORM ? launch_nq<ADD_NORM>(x, gain, other, y, sum, q, scale, cols, eps, gain_offset, st)
+                                  : launch_nq<NORM_ADD>(x, gain, other, y, sum, q, scale, cols, eps, gain_offset, st);
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}
