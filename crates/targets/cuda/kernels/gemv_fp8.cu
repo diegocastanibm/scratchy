@@ -188,6 +188,9 @@ struct gemv_smem {
 template <int ROWS>
 __device__ inline float quantize_row(const in_gl& a, int a_row, int chunks, int c0, int count,
                                      const gemv_smem<ROWS>& sm) {
+    // FP8 S8 W5: under a programmatic edge, wait for the previous kernel before `a`'s row, the
+    // first predecessor read (the dense ring before it reads only the weights, written by none).
+    pdl::wait();
     const int w = kittens::warpid();
     if (w == 0) {
         if (warp::laneid() == 0) {
@@ -248,6 +251,8 @@ __device__ inline void gemv_dots(const gemv_globals& g, const gemv_smem<ROWS>& s
     const bool live = rows > 0 && count > 0;
     int depth = 0;
     if constexpr (EXPERT) {
+        // FP8 S8 W5: `topk_idx` is the router's output, read before the prologue.
+        pdl::wait();
         depth = g.topk_idx[{0, 0, 0, p}];
     }
     // Chunk `j` of the split (`c0 + j` of the row) into stage `(j0 + j) % STAGES`.
@@ -504,6 +509,8 @@ __global__ __launch_bounds__(NUM_THREADS, 2) void gate_up_gemv_fp8_ker(
             }
         }
     }
+    // FP8 S8 W5: every write is done; the next kernel may launch.
+    pdl::arrive();
 }
 
 // The gate/up GEMV's reduce: `reduce_warp`'s sums of the gate's and the up's scaled partials,

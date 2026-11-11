@@ -300,6 +300,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_one_row_ker(
         }
     }
     __syncwarp();
+    // FP8 S8 W5: under a programmatic edge, wait for the previous kernel here. Nothing above touches
+    // global memory (the semaphores are shared), and the first read of `x` is below.
+    pdl::wait();
     // Pass 1's load `i` of this warp's `mine` tiles, the 16-row kernel's `issue` at `i < mine`.
     auto issue = [&](int i) {
         const int stage = i % STAGES, t = w + i * WARPS;
@@ -407,6 +410,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_one_row_ker(
         warp::tma::store_async(g.y, x_smem[0][1], at);
         warp::tma::store_async_wait();
     }
+    // FP8 S8 W5: every write is done; the next kernel may launch.
+    pdl::arrive();
 }
 
 // Build the views and launch `rms_norm_bf16_ker<FORM>`, or at `rows == 1` the one-row form
