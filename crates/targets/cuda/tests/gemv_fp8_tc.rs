@@ -994,33 +994,27 @@ fn the_one_row_quantize_times_are_recorded() {
     }
 }
 
-// ── Q1's fix: the zero-fill rows' division (cap3 follow-up) ──────────────────────
+// ── Q1, the one-row quantize: its edge-case bits and its phase trace ──────────────────
 
-/// Q1 at `variant` on `x`, its trace into `trace` when given: its e4m3 bytes and its scale's bits.
-fn quant_one_variant(
-    device: &CudaDevice,
-    x: &[u16],
-    variant: u32,
-    trace: Option<&DeviceBuffer>,
-) -> (Vec<u8>, u32) {
-    use scratchy_target_cuda::kernels::quant_row_fp8_one_variant;
+/// Q1 on `x`, its phase trace into `trace`: its e4m3 bytes and its scale's bits.
+fn quant_one_traced(device: &CudaDevice, x: &[u16], trace: &DeviceBuffer) -> (Vec<u8>, u32) {
+    use scratchy_target_cuda::kernels::quant_row_fp8_one_traced;
     let k = x.len();
     let xb = DeviceBuffer::upload(device, x).expect("x");
     let q = filled(device, k, 0xEE);
     let s = filled(device, 4, 0xEE);
-    let t = trace.map_or(std::ptr::null_mut(), |t| t.ptr());
-    // SAFETY: `xb` holds k bf16, `q` k bytes, `s` one f32 and `t` (when not null) the trace's
-    // ⌈k / 256⌉ · 8 f32, all their own allocations; null is the default stream.
+    // SAFETY: `xb` holds k bf16, `q` k bytes, `s` one f32 and `trace` ⌈k / 256⌉ · 8 f32, all their
+    // own allocations; null is the default stream.
     unsafe {
-        quant_row_fp8_one_variant(
+        quant_row_fp8_one_traced(
             xb.ptr().cast_const(),
             (q.ptr(), s.ptr()),
             k as u32,
-            (variant, t),
+            trace.ptr(),
             std::ptr::null_mut(),
         )
     }
-    .expect("quant_row_fp8_one_variant launch");
+    .expect("quant_row_fp8_one_traced launch");
     let qb: Vec<u8> = (q.download().expect("q").iter())
         .flat_map(|h| h.to_le_bytes())
         .take(k)
@@ -1031,13 +1025,12 @@ fn quant_one_variant(
     (qb, u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]))
 }
 
-/// Every Q1 form (0 the first, 1 the tile dividing row 0 only, 2 one element a thread, the
-/// launcher's) is `quant_rows_fp8`'s row 0 bit for bit (bytes and scale), at the 27B's 5,120 and
-/// 17,408 columns, Gemma's 2,816 and 2,112, 64 and 1,088, on random rows, a zero row, a row of one
-/// large value, and a row of signed zeros and bf16 subnormals among random values (the fixed form
-/// divides only row 0, so its zeros' signs must survive).
+/// Q1 (and its traced instance) is `quant_rows_fp8`'s row 0 bit for bit (bytes and scale), at the
+/// 27B's 5,120 and 17,408 columns, Gemma's 2,816 and 2,112, 64 and 1,088, on random rows, a zero
+/// row, a row of one large value, and a row of signed zeros and bf16 subnormals among random
+/// values (a -0's byte must survive).
 #[test]
-fn both_one_row_quantize_forms_are_quant_rows_fp8_bit_for_bit() {
+fn the_one_row_quantize_keeps_signed_zeros_and_subnormals() {
     let device = h100();
     let mut pass = true;
     for k in [5120usize, 17408, 2816, 2112, 64, 1088] {
@@ -1059,6 +1052,7 @@ fn both_one_row_quantize_forms_are_quant_rows_fp8_bit_for_bit() {
             ("one_large", big),
             ("signed_zeros_subnormals", odd),
         ];
+        let trace = filled(&device, k.div_ceil(256) * 8 * 4, 0);
         for (what, x) in rows {
             let act = Act::new(&device, &x);
             act.quantize();
@@ -1070,102 +1064,63 @@ fn both_one_row_quantize_forms_are_quant_rows_fp8_bit_for_bit() {
                 .flat_map(|h| h.to_le_bytes())
                 .collect();
             let want_s = u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]);
-            for variant in [0u32, 1, 2] {
-                let (got_q, got_s) = quant_one_variant(&device, &x, variant, None);
+            for (form, (got_q, got_s)) in [
+                ("plain", quant_one(&device, &x)),
+                ("traced", quant_one_traced(&device, &x, &trace)),
+            ] {
                 let bad = got_q.iter().zip(&want_q).filter(|(a, b)| a != b).count();
                 let ok = bad == 0 && got_s == want_s;
                 eprintln!(
-                    "Q1V_BITS variant={variant} k={k} {what}: mismatched_bytes={bad} \
-                     scale={got_s:#010x} want={want_s:#010x} {}",
+                    "Q1V_BITS {form} k={k} {what}: mismatched_bytes={bad} scale={got_s:#010x} \
+                     want={want_s:#010x} {}",
                     verdict(ok)
                 );
                 pass &= ok;
             }
         }
     }
-    assert!(pass, "a Q1 form is not quant_rows_fp8's row 0");
+    assert!(pass, "Q1 is not quant_rows_fp8's row 0");
 }
 
-/// Every Q1 form timed at the 27B's 5,120 and 17,408 columns, one launch and ten back to back,
-/// read-flush cold and hot, two rounds (A, B, A, B), as `TC_TIME` lines; then one traced launch of
-/// each, as `Q1_TRACE` lines: each phase's median over the CTAs and CTA 0's, in cycles from the
-/// CTA's start (entry, chunks arrived, amax shared, tile arrived, tile divided, stored).
+/// One traced launch of Q1 at the 27B's 5,120 and 17,408 columns, as `Q1_TRACE` lines: each
+/// phase's median over the CTAs, CTA 0's and the max, in cycles from the CTA's start (chunks
+/// arrived, amax shared, owned chunk ready, element quantized, stored).
 #[test]
-fn both_one_row_quantize_forms_are_timed_and_traced() {
-    use scratchy_target_cuda::kernels::quant_row_fp8_one_variant;
+fn the_one_row_quantize_phases_are_recorded() {
     let device = h100();
-    let flush = Flush::new(&device);
-    for k in [5120u32, 17408] {
-        let ku = k as usize;
-        let x = bf16_inputs(ku, 0x7D3);
-        let xb = DeviceBuffer::upload(&device, &x).expect("x");
-        let q = filled(&device, ku, 0);
-        let s = filled(&device, 4, 0);
-        for round in 1..=2 {
-            for (variant, name) in [
-                (0u32, "q1_v0_zero_rows_divided"),
-                (1, "q1_v1_row0_only"),
-                (2, "q1_v2_thread_per_element"),
-            ] {
-                let one = || {
-                    // SAFETY: `xb` holds k bf16, `q` k bytes and `s` one f32; no trace; null is
-                    // the default stream.
-                    unsafe {
-                        quant_row_fp8_one_variant(
-                            xb.ptr().cast_const(),
-                            (q.ptr(), s.ptr()),
-                            k,
-                            (variant, std::ptr::null_mut()),
-                            std::ptr::null_mut(),
-                        )
-                    }
-                    .expect("quant_row_fp8_one_variant launch");
-                };
-                record(&flush, &format!("q1_1x{k}"), name, round, ku * 2, one);
-                record(
-                    &flush,
-                    &format!("q1_1x{k}"),
-                    &format!("{name}_x10"),
-                    round,
-                    10 * ku * 2,
-                    || (0..10).for_each(|_| one()),
-                );
-            }
-        }
-        let ctas = ku.div_ceil(256);
-        for variant in [0u32, 1, 2] {
-            let trace = filled(&device, ctas * 8 * 4, 0);
-            let _ = quant_one_variant(&device, &x, variant, Some(&trace));
-            let tb: Vec<u8> = (trace.download().expect("trace").iter())
-                .flat_map(|h| h.to_le_bytes())
-                .collect();
-            let t: Vec<f32> = tb
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|&c| f32::from_le_bytes(c))
-                .collect();
-            for (p, phase) in [
-                "entry",
-                "chunks_arrived",
-                "amax_shared",
-                "tile_arrived",
-                "tile_divided",
-                "stored",
-            ]
+    for k in [5120usize, 17408] {
+        let ctas = k.div_ceil(256);
+        let trace = filled(&device, ctas * 8 * 4, 0);
+        let _ = quant_one_traced(&device, &bf16_inputs(k, 0x7D3), &trace);
+        let tb: Vec<u8> = (trace.download().expect("trace").iter())
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        let t: Vec<f32> = tb
+            .as_chunks::<4>()
+            .0
             .iter()
-            .enumerate()
-            .skip(1)
-            {
-                let mut v: Vec<f32> = (0..ctas).map(|c| t[c * 8 + p]).collect();
-                v.sort_by(f32::total_cmp);
-                eprintln!(
-                    "Q1_TRACE variant={variant} k={k} {phase}: median={} cycles cta0={} max={} ({ctas} CTAs)",
-                    v[v.len() / 2],
-                    t[p],
-                    v[v.len() - 1]
-                );
-            }
+            .map(|&c| f32::from_le_bytes(c))
+            .collect();
+        for (p, phase) in [
+            "entry",
+            "chunks_arrived",
+            "amax_shared",
+            "owned_ready",
+            "quantized",
+            "stored",
+        ]
+        .iter()
+        .enumerate()
+        .skip(1)
+        {
+            let mut v: Vec<f32> = (0..ctas).map(|c| t[c * 8 + p]).collect();
+            v.sort_by(f32::total_cmp);
+            eprintln!(
+                "Q1_TRACE k={k} {phase}: median={} cycles cta0={} max={} ({ctas} CTAs)",
+                v[v.len() / 2],
+                t[p],
+                v[v.len() - 1]
+            );
         }
     }
 }
