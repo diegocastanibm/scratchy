@@ -23,6 +23,9 @@ use common::numerics::{
 use scratchy_target_cuda::kernels::{KernelError, add_bf16, rms_norm_bf16, silu_mul_bf16};
 use scratchy_target_cuda::kernels::{add_rms_norm_bf16, norm_add_bf16, rms_norm_one_row_variant};
 use scratchy_target_cuda::kernels::{
+    add_rms_norm_quant_fp8, quant_row_fp8_one, rms_norm_quant_fp8,
+};
+use scratchy_target_cuda::kernels::{
     gelu_mul_bf16, layer_scale_bf16, rms_norm_unit_bf16, scale_bf16, soft_cap_bf16,
 };
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
@@ -1866,6 +1869,223 @@ fn the_row_norm_graph_times_are_recorded() {
                 r.launch(form, offset, 0, s)
             });
             graph_record(&scrub, (&shape, "n1_norm", round), |s| {
+                r.launch(form, offset, 1, s)
+            });
+        }
+    }
+}
+
+// ── FP8 S8 N2: the decode norm and the next fp8 GEMM's quant in one launch ───
+
+/// One side's outputs: `y` and `sum` bf16, `q` the e4m3 row and `scale` one f32, each with a
+/// sentinel tail.
+struct N2Out {
+    y: DeviceBuffer,
+    sum: DeviceBuffer,
+    q: DeviceBuffer,
+    scale: DeviceBuffer,
+}
+
+/// One row's inputs (`x`, `b` the addend, the gain) and both sides' outputs: 0 today's row norm
+/// then the one-row quantize (two launches), 1 the quantized row norm (one).
+struct N2Row {
+    x: DeviceBuffer,
+    b: DeviceBuffer,
+    g: DeviceBuffer,
+    out: [N2Out; 2],
+    cols: usize,
+}
+
+/// The byte every quant output holds before a launch, past what the launch writes.
+const N2_SENTINEL: u8 = 0xA5;
+
+impl N2Row {
+    fn new(device: &CudaDevice, (x, b, g): (&[u16], &[u16], &[u16])) -> Self {
+        let up = |v: &[u16]| DeviceBuffer::upload(device, v).expect("upload");
+        let cols = x.len();
+        let bytes = |n: usize| {
+            DeviceBuffer::upload_bytes(device, &vec![N2_SENTINEL; n + 256]).expect("an output")
+        };
+        let side = || N2Out {
+            y: output(device, cols),
+            sum: output(device, cols),
+            q: bytes(cols),
+            scale: bytes(4),
+        };
+        Self {
+            x: up(x),
+            b: up(b),
+            g: up(g),
+            out: [side(), side()],
+            cols,
+        }
+    }
+
+    /// Side `side` of form `form` (the norm or `ADD_NORM`) on `stream`.
+    fn launch(&self, form: NormForm, offset: f32, side: usize, stream: *mut std::ffi::c_void) {
+        let o = &self.out[side];
+        let cols = self.cols as u32;
+        let (x, b, g) = (
+            self.x.ptr().cast_const(),
+            self.b.ptr().cast_const(),
+            self.g.ptr().cast_const(),
+        );
+        // SAFETY: every buffer is its own cudaMalloc allocation (256-byte aligned) of at least
+        // `cols` elements of its type (the outputs longer), the outputs distinct; `stream` is null
+        // or a live stream of this device.
+        let r = unsafe {
+            match (form, side) {
+                (NormForm::Norm, 0) => {
+                    rms_norm_bf16(x, g, o.y.ptr(), (1, cols), EPS, offset, stream).and_then(|()| {
+                        quant_row_fp8_one(o.y.ptr(), (o.q.ptr(), o.scale.ptr()), cols, stream)
+                    })
+                }
+                (_, 0) => add_rms_norm_bf16(
+                    (x, b),
+                    g,
+                    (o.sum.ptr(), o.y.ptr()),
+                    (1, cols),
+                    (EPS, offset),
+                    stream,
+                )
+                .and_then(|()| {
+                    quant_row_fp8_one(o.y.ptr(), (o.q.ptr(), o.scale.ptr()), cols, stream)
+                }),
+                (NormForm::Norm, _) => rms_norm_quant_fp8(
+                    (x, g),
+                    (o.y.ptr(), o.q.ptr(), o.scale.ptr()),
+                    cols,
+                    (EPS, offset),
+                    stream,
+                ),
+                (_, _) => add_rms_norm_quant_fp8(
+                    (x, b),
+                    g,
+                    (o.sum.ptr(), o.y.ptr(), o.q.ptr(), o.scale.ptr()),
+                    cols,
+                    (EPS, offset),
+                    stream,
+                ),
+            }
+        };
+        r.expect("a norm + quant launch");
+    }
+
+    /// Side `side`'s outputs as bytes: `y`, the sum (`ADD_NORM`), `q` and the scale; and whether
+    /// every tail held.
+    fn outputs(&self, form: NormForm, side: usize) -> (Vec<u8>, bool) {
+        let o = &self.out[side];
+        let bytes = |b: &DeviceBuffer| -> Vec<u8> {
+            (b.download().expect("download").iter())
+                .flat_map(|h| h.to_le_bytes())
+                .collect()
+        };
+        let (y, mut tails) = result(&o.y, self.cols);
+        let mut v: Vec<u8> = y.iter().flat_map(|h| h.to_le_bytes()).collect();
+        if form == NormForm::AddNorm {
+            let (sum, t) = result(&o.sum, self.cols);
+            v.extend(sum.iter().flat_map(|h| h.to_le_bytes()));
+            tails &= t;
+        }
+        let (q, scale) = (bytes(&o.q), bytes(&o.scale));
+        tails &= q[self.cols..].iter().all(|&b| b == N2_SENTINEL);
+        tails &= scale[4..].iter().all(|&b| b == N2_SENTINEL);
+        v.extend_from_slice(&q[..self.cols]);
+        v.extend_from_slice(&scale[..4]);
+        (v, tails)
+    }
+}
+
+/// FP8 S8 N2: the quantized row norm is today's row norm then the one-row quantize, byte for
+/// byte on every output (`y`, `ADD_NORM`'s sum, the e4m3 row and its scale), the norm and
+/// `ADD_NORM` at the three models' widths (2,048, 2,816, 5,120), gain offsets 0 and 1, on 3 random
+/// rows and 3 edge rows (all zeros, ±65,504, subnormals beside the largest finite bf16), as
+/// `N2_BITS` lines. Every tail is intact.
+#[test]
+fn the_quantized_row_norm_is_the_row_norm_then_its_quantize_bit_for_bit() {
+    let device = h100();
+    let mut pass = true;
+    for cols in [2048usize, 2816, 5120] {
+        let mut rows_in: Vec<(String, Vec<u16>, Vec<u16>)> = (0..3u64)
+            .map(|s| {
+                let seed = 0x0E21_0000 ^ (cols as u64) << 8 ^ s;
+                (
+                    format!("random{s}"),
+                    bf16_inputs(cols, seed),
+                    bf16_inputs(cols, seed ^ 0x55),
+                )
+            })
+            .collect();
+        rows_in.push(("zeros".into(), vec![0; cols], vec![0; cols]));
+        let big: Vec<u16> = (0..cols)
+            .map(|c| bits(if c % 2 == 0 { 65504.0 } else { -65504.0 }))
+            .collect();
+        rows_in.push(("max".into(), big.clone(), big));
+        let tiny: Vec<u16> = (0..cols)
+            .map(|c| [0x0001, 0x8001, 0x7F7F, 0x0080][c % 4])
+            .collect();
+        rows_in.push(("subnormal".into(), tiny.clone(), tiny));
+        for (what, x, b) in &rows_in {
+            for offset in [SCALE, ONE_PLUS_SCALE] {
+                let g = match offset {
+                    SCALE => bf16_inputs(cols, 0x0E22_0000 ^ cols as u64),
+                    _ => centred_gains(cols, 0x0E23_0000 ^ cols as u64),
+                };
+                let r = N2Row::new(&device, (x, b, &g));
+                for form in [NormForm::Norm, NormForm::AddNorm] {
+                    let null = std::ptr::null_mut();
+                    r.launch(form, offset, 0, null);
+                    r.launch(form, offset, 1, null);
+                    let (want, wt) = r.outputs(form, 0);
+                    let (got, gt) = r.outputs(form, 1);
+                    let m = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+                    let ok = m == 0 && got.len() == want.len() && wt && gt;
+                    eprintln!(
+                        "N2_BITS {form:?} cols={cols} offset={offset} {what}: mismatched_bytes={m} \
+                         tails_intact={} {}",
+                        wt && gt,
+                        verdict(ok)
+                    );
+                    pass &= ok;
+                }
+            }
+        }
+    }
+    assert!(
+        pass,
+        "the quantized row norm is not the row norm then its quantize"
+    );
+}
+
+/// The decode norms that feed an fp8 GEMM: (model, width, form, gain offset).
+const N2_SHAPES: &[(&str, usize, NormForm, f32)] = &[
+    ("27B", 5120, NormForm::Norm, ONE_PLUS_SCALE),
+    ("27B", 5120, NormForm::AddNorm, ONE_PLUS_SCALE),
+    ("35B", 2048, NormForm::Norm, ONE_PLUS_SCALE),
+    ("35B", 2048, NormForm::AddNorm, ONE_PLUS_SCALE),
+    ("Gemma", 2816, NormForm::Norm, SCALE),
+    ("Gemma", 2816, NormForm::AddNorm, SCALE),
+];
+
+/// Recorded, not asserted (N2's gate reads it): inside a captured graph of 10 back-to-back nodes,
+/// today's row norm then the one-row quantize (`n1_norm+q1`, two nodes a pair) against the
+/// quantized row norm (`n2_norm_quant`), read-cold and hot, two rounds (A, B, A, B), as
+/// `TC_TIME … _graph_per_node` lines (per pair).
+#[test]
+fn the_quantized_row_norm_graph_times_are_recorded() {
+    let device = h100();
+    let scrub = DeviceBuffer::upload_bytes(&device, &vec![0u8; SCRUB_BYTES]).expect("scrub");
+    for &(model, cols, form, offset) in N2_SHAPES {
+        let x = bf16_inputs(cols, 0x0E24_0000 ^ cols as u64);
+        let b = bf16_inputs(cols, 0x0E25_0000 ^ cols as u64);
+        let g = centred_gains(cols, 0x0E26_0000 ^ cols as u64);
+        let r = N2Row::new(&device, (&x, &b, &g));
+        let shape = format!("{model}_{form:?}_{cols}");
+        for round in 1..=2 {
+            graph_record(&scrub, (&shape, "n1_norm+q1", round), |s| {
+                r.launch(form, offset, 0, s)
+            });
+            graph_record(&scrub, (&shape, "n2_norm_quant", round), |s| {
                 r.launch(form, offset, 1, s)
             });
         }

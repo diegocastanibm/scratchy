@@ -86,6 +86,19 @@
 // So the bits are the one-row form's, and so the 16-row kernel's. Rows up to `ROW_TILES` tiles take
 // it (`launch`); wider ones keep the one-row form.
 //
+// THE QUANTIZED ROW FORM (`rms_norm_row_ker<FORM, true>`, FP8 S8 N2; the norm and `ADD_NORM`): the
+// row form, which also writes the next fp8 GEMM's input, `quant_rows_fp8`'s e4m3 row `q` and its
+// scale, bit for bit the one-row quantize's (`quant_rows_fp8.cu`'s Q1) of the row it stores. Pass 1
+// and pass 2 are the row form's, so `y` (and the sum) are its bits. After `inv`, every thread forms
+// normed element pairs of the whole row with pass 2's ops on the same values (`ADD_NORM`'s sum
+// rounded, `· inv` as `mul_row`, `· (gain + gain_offset)` as `add` then `mul_col`, every op the
+// float2 `base_ops` of TK's maps), rounded to bf16 as pass 2's store rounds them and widened back
+// (exact), and the CTA takes their max of absolute values (exact in any order, so Q1's `amax`),
+// then Q1's `scale = fp8_scale(amax)`. Each of its 128 threads quantizes one pair of the owned
+// tile with Q1's `fp8_quant_pre` and TK's scalar e4m3 convertor, written through the `gl`
+// accessor (columns past `cols` skipped); CTA 0 writes the scale. The whole gain row is loaded
+// with the row, `ROW_TILES` more `sv_bf<256>` than the row form's.
+//
 // Built with `--use_fast_math` (build.rs): `rsqrtf` is the approximate reciprocal square root, as
 // before. Shared memory: 4 warps × 2 stages × (two 8 KiB tiles and a 512-byte gain vector), and
 // the four 64-byte sums, plus 1,024 bytes of alignment slack, set once by
@@ -129,6 +142,9 @@ using gain_vec = sv_bf<COLS>;
 using sums_vec = sv_fl<ROWS>;
 using x_gl = gl<bf16, 1, 1, -1, -1, tile>;
 using g_gl = gl<bf16, 1, 1, 1, -1, gain_vec>;
+// The quantized row form's outputs: `q [1, cols]` e4m3 and its `[1]` f32 scale (no tensor map).
+using q_gl = gl<fp8e4m3, 1, 1, -1, -1>;
+using scale_gl = gl<float, 1, 1, 1, -1>;
 // The row form's widest row, in 256-column tiles (17,408 columns).
 constexpr int ROW_TILES = 68;
 using acc_tile = rt_fl<ROWS, COLS>;
@@ -147,6 +163,9 @@ struct rms_globals {
     // The row form's views of row 0 of `x` and `other` as `[cols]` vectors (`gain`'s view).
     g_gl x_row;
     g_gl other_row;
+    // The quantized row form's outputs (unwritten by every other form).
+    q_gl q;
+    scale_gl scale;
     // The 256-column tiles of a row, the last one partial when `cols % 256 ≠ 0`.
     int col_tiles;
     float cols;
@@ -432,11 +451,79 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_one_row_ker(
     }
 }
 
-// `rows == 1`, the row form (N1): CTA `blockIdx.x` owns column tile `blockIdx.x`; pass 1's sums on
-// the row's vectors in the 16-row kernel's order; then the one-row form's tail and pass 2.
+// The quantized row form's quantize (N2), by the CTA's 128 threads after `inv`: the whole row's
+// normed values' `amax`, then the owned tile's e4m3 bytes and, from CTA 0, the scale.
 template <int FORM>
+__device__ inline void quantize_row(const rms_globals& g, const row_values& inv,
+                                    const gain_vec (&x_row)[ROW_TILES],
+                                    const gain_vec (&b_row)[ROW_TILES], const gain_vec* g_row,
+                                    int t_own) {
+    constexpr bool GAIN = FORM != UNIT;
+    __shared__ sv_fl<ROWS> inv_s;
+    __shared__ sv_fl<NUM_THREADS> amax_s;
+    const int tid = int(threadIdx.x);
+    const int cols = int(g.cols);
+    // Row 0's `inv`, as pass 2's `mul_row` packs it.
+    if (kittens::warpid() == 0) {
+        warp::store(inv_s, inv);
+    }
+    __syncthreads();
+    const float2 r = base_types::packing<float>::pack(inv_s[0]);
+    const float2 offset = base_types::packing<float>::pack(g.gain_offset);
+    // The stored bf16 pair at column `c` of tile `t`, widened back: pass 2's ops on its values.
+    const auto normed = [&](int t, int c) {
+        float2 v = base_types::convertor<float2, bf16_2>::convert(
+            bf16_2{x_row[t][c], x_row[t][c + 1]});
+        if constexpr (FORM == ADD_NORM) {
+            const float2 b = base_types::convertor<float2, bf16_2>::convert(
+                bf16_2{b_row[t][c], b_row[t][c + 1]});
+            v = base_types::convertor<float2, bf16_2>::convert(
+                base_types::convertor<bf16_2, float2>::convert(base_ops::sum::op<float2>(v, b)));
+        }
+        v = base_ops::mul::op<float2>(v, r);
+        if constexpr (GAIN) {
+            const float2 gain = base_ops::sum::op<float2>(
+                base_types::convertor<float2, bf16_2>::convert(
+                    bf16_2{g_row[t][c], g_row[t][c + 1]}),
+                offset);
+            v = base_ops::mul::op<float2>(v, gain);
+        }
+        return base_types::convertor<float2, bf16_2>::convert(
+            base_types::convertor<bf16_2, float2>::convert(v));
+    };
+    float amax = 0.0f;
+    for (int c = 2 * tid; c < cols; c += 2 * NUM_THREADS) {
+        const float2 y = normed(c / COLS, c % COLS);
+        amax = base_ops::max::op<float>(
+            amax, base_ops::max::op<float>(base_ops::abs::op<float>(y.x),
+                                           base_ops::abs::op<float>(y.y)));
+    }
+    amax_s[tid] = amax;
+    __syncthreads();
+    rv_fl<NUM_THREADS> all;
+    warp::load(all, amax_s);
+    const float scale = scratchy::ops::fp8_scale::op<float>(warp::max(all));
+    if (t_own == 0 && tid == 0) {
+        g.scale[{0, 0, 0, 0}] = scale;
+    }
+    // One pair of the owned tile a thread.
+    const int c = t_own * COLS + 2 * tid;
+    if (c < cols) {
+        const float2 y = normed(t_own, 2 * tid);
+        g.q[{0, 0, 0, c}] = base_types::convertor<fp8e4m3, float>::convert(
+            scratchy::ops::fp8_quant_pre::op<float>(y.x, scale));
+        g.q[{0, 0, 0, c + 1}] = base_types::convertor<fp8e4m3, float>::convert(
+            scratchy::ops::fp8_quant_pre::op<float>(y.y, scale));
+    }
+}
+
+// `rows == 1`, the row form (N1): CTA `blockIdx.x` owns column tile `blockIdx.x`; pass 1's sums on
+// the row's vectors in the 16-row kernel's order; then the one-row form's tail and pass 2. Under
+// `QUANT` (N2), also the owned tile's e4m3 quantization and the row's scale.
+template <int FORM, bool QUANT>
 __global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_row_ker(
     const __grid_constant__ rms_globals g) {
+    static_assert(!QUANT || FORM == NORM || FORM == ADD_NORM, "a quantized row is a norm's");
     constexpr bool GAIN = FORM != UNIT;
     constexpr bool OTHER = FORM == ADD_NORM || FORM == NORM_ADD;
     extern __shared__ int __shm[];
@@ -448,6 +535,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_row_ker(
     gain_vec(&x_row)[ROW_TILES] = al.allocate<gain_vec, ROW_TILES>();
     gain_vec(&b_row)[ROW_TILES] = al.allocate<gain_vec, ROW_TILES>();
     sums_vec(&sums)[WARPS] = al.allocate<sums_vec, WARPS>();
+    // The quantized form's whole gain row.
+    gain_vec* g_row = nullptr;
+    if constexpr (QUANT) {
+        g_row = &al.allocate<gain_vec, ROW_TILES>()[0];
+    }
     // Each lane chain's sum, and each tile's (`ROW_TILES` rounded up to 16).
     __shared__ sv_fl<4 * ROW_TILES> lane_s;
     __shared__ sv_fl<80> tile_s;
@@ -464,12 +556,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_row_ker(
     __syncthreads();
     if (w == 0) {
         // The row's vectors, then pass 2's owned tiles.
-        warp::tma::expect_bytes(row_arrived,
-                                uint32_t(tiles * sizeof(gain_vec) * (FORM == ADD_NORM ? 2 : 1)));
+        constexpr int ROW_VECS = 1 + (FORM == ADD_NORM ? 1 : 0) + (QUANT && GAIN ? 1 : 0);
+        warp::tma::expect_bytes(row_arrived, uint32_t(tiles * sizeof(gain_vec) * ROW_VECS));
         for (int t = 0; t < tiles; t++) {
             warp::tma::load_async(x_row[t], g.x_row, {0, 0, 0, t}, row_arrived);
             if constexpr (FORM == ADD_NORM) {
                 warp::tma::load_async(b_row[t], g.other_row, {0, 0, 0, t}, row_arrived);
+            }
+            if constexpr (QUANT && GAIN) {
+                warp::tma::load_async(g_row[t], g.gain, {0, 0, 0, t}, row_arrived);
             }
         }
         coord<tile> at = {0, 0, 0, t_own};
@@ -542,6 +637,9 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_row_ker(
     warp::one(rcp);
     warp::div(rcp, rcp, g.cols);
     scratchy::ops::rv_ternary_map<scratchy::ops::rms_inv_fused>(inv, total, rcp, g.eps);
+    if constexpr (QUANT) {
+        quantize_row<FORM>(g, inv, x_row, b_row, g_row, t_own);
+    }
     // Pass 2, warp 0's on the owned tile: the one-row form's.
     if (w == 0) {
         wait(owned, 0);
@@ -581,6 +679,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_row_ker(
 constexpr size_t ROW_SMEM_USED = 2 * STAGES * sizeof(tile) + sizeof(gain_vec) +
                                  2 * ROW_TILES * sizeof(gain_vec) + WARPS * sizeof(sums_vec);
 constexpr int ROW_SMEM_BYTES = int(ROW_SMEM_USED) + 1024;
+constexpr int ROW_QUANT_SMEM_BYTES = ROW_SMEM_BYTES + int(ROW_TILES * sizeof(gain_vec));
+static_assert(ROW_QUANT_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
 static_assert(ROW_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
 
 // Build the views and launch `rms_norm_bf16_ker<FORM>`, or at `rows == 1` the one-row form
@@ -606,12 +706,24 @@ int launch(const void* x, const void* gain, void* y, const void* other, void* su
         return g_gl{static_cast<bf16*>(const_cast<void*>(p)), nullptr, nullptr, nullptr,
                     size_t(cols)};
     };
-    rms_globals G{view(x),   gg,  view(y),          view(other), view(sum), row(x), row(other),
-                  col_tiles, float(cols), eps, gain_offset};
+    // No form here writes `q` or the scale; `y`'s address stands for both.
+    rms_globals G{view(x),
+                  gg,
+                  view(y),
+                  view(other),
+                  view(sum),
+                  row(x),
+                  row(other),
+                  q_gl{static_cast<fp8e4m3*>(y), nullptr, nullptr, size_t(rows), size_t(cols)},
+                  scale_gl{static_cast<float*>(y), nullptr, nullptr, nullptr, size_t(1)},
+                  col_tiles,
+                  float(cols),
+                  eps,
+                  gain_offset};
     void* args[] = {&G};
     if (rows == 1 && (one_row == 1 || (one_row == -1 && col_tiles <= ROW_TILES))) {
         const dim3 grid{uint32_t(col_tiles)}, block{NUM_THREADS};
-        return static_cast<int>(cudaLaunchKernel(rms_norm_row_ker<FORM>, grid, block, args,
+        return static_cast<int>(cudaLaunchKernel(rms_norm_row_ker<FORM, false>, grid, block, args,
                                                  ROW_SMEM_BYTES, stream));
     }
     if (rows == 1) {
@@ -623,6 +735,51 @@ int launch(const void* x, const void* gain, void* y, const void* other, void* su
     const dim3 grid((rows + uint32_t(ROWS) - 1) / uint32_t(ROWS)), block(NUM_THREADS);
     return static_cast<int>(
         cudaLaunchKernel(rms_norm_bf16_ker<FORM>, grid, block, args, RMS_SMEM_BYTES, stream));
+}
+
+// `quant_rows_fp8`'s column rule (`step::GEMM_FP8_K_MULTIPLE`): the quantized form's `cols` is a
+// multiple of it.
+constexpr uint32_t QUANT_COL_MULTIPLE = 64;
+
+// Build the views and launch the quantized row form `rms_norm_row_ker<FORM, true>` over one row:
+// `y` (and `ADD_NORM`'s `sum`) as the row form's, `q` and `scale` as the one-row quantize's of `y`.
+// Can throw (a tensor-map encode); the caller catches.
+template <int FORM>
+int launch_quant(const void* x, const void* gain, void* y, const void* other, void* sum, void* q,
+                 void* scale, uint32_t cols, float eps, float gain_offset, cudaStream_t stream) {
+    const auto view = [&](const void* p) {
+        return x_gl{static_cast<bf16*>(const_cast<void*>(p)), nullptr, nullptr, size_t(1),
+                    size_t(cols)};
+    };
+    const auto row = [&](const void* p) {
+        return g_gl{static_cast<bf16*>(const_cast<void*>(p)), nullptr, nullptr, nullptr,
+                    size_t(cols)};
+    };
+    const int col_tiles = int((cols + uint32_t(COLS) - 1) / uint32_t(COLS));
+    rms_globals G{view(x),
+                  row(gain),
+                  view(y),
+                  view(other),
+                  view(sum),
+                  row(x),
+                  row(other),
+                  q_gl{static_cast<fp8e4m3*>(q), nullptr, nullptr, size_t(1), size_t(cols)},
+                  scale_gl{static_cast<float*>(scale), nullptr, nullptr, nullptr, size_t(1)},
+                  col_tiles,
+                  float(cols),
+                  eps,
+                  gain_offset};
+    void* args[] = {&G};
+    const dim3 grid{uint32_t(col_tiles)}, block{NUM_THREADS};
+    return static_cast<int>(cudaLaunchKernel(rms_norm_row_ker<FORM, true>, grid, block, args,
+                                             ROW_QUANT_SMEM_BYTES, stream));
+}
+
+// The quantized form's shape rule: one row's, `cols` a multiple of 64 and at most `ROW_TILES`
+// tiles.
+bool quant_refused(uint32_t cols) {
+    return cols == 0 || cols % QUANT_COL_MULTIPLE != 0 ||
+           cols > uint32_t(ROW_TILES) * uint32_t(COLS);
 }
 
 bool refused(uint32_t rows, uint32_t cols) {
@@ -648,10 +805,17 @@ extern "C" int scratchy_cuda_rms_norm_bf16_prepare(void) {
             return static_cast<int>(e);
         }
     }
-    for (auto ker : {rms_norm_row_ker<NORM>, rms_norm_row_ker<UNIT>, rms_norm_row_ker<ADD_NORM>,
-                     rms_norm_row_ker<NORM_ADD>}) {
+    for (auto ker : {rms_norm_row_ker<NORM, false>, rms_norm_row_ker<UNIT, false>,
+                     rms_norm_row_ker<ADD_NORM, false>, rms_norm_row_ker<NORM_ADD, false>}) {
         const cudaError_t e =
             cudaFuncSetAttribute(ker, cudaFuncAttributeMaxDynamicSharedMemorySize, ROW_SMEM_BYTES);
+        if (e != cudaSuccess) {
+            return static_cast<int>(e);
+        }
+    }
+    for (auto ker : {rms_norm_row_ker<NORM, true>, rms_norm_row_ker<ADD_NORM, true>}) {
+        const cudaError_t e = cudaFuncSetAttribute(
+            ker, cudaFuncAttributeMaxDynamicSharedMemorySize, ROW_QUANT_SMEM_BYTES);
         if (e != cudaSuccess) {
             return static_cast<int>(e);
         }
@@ -778,6 +942,50 @@ extern "C" int scratchy_cuda_rms_norm_one_row_variant(const void* x, const void*
             default:
                 return launch<NORM_ADD>(x, gain, y, other, sum, 1, cols, eps, gain_offset, s, v);
         }
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}
+
+// FP8 S8 N2: one row's norm (`scratchy_cuda_rms_norm_bf16`'s, `rows` 1) and the next fp8 GEMM's
+// input in one launch: `y [1, cols]` bf16 as the row form writes it, and `q [1, cols]` e4m3 and
+// `scale [1]` f32, bit for bit `scratchy_cuda_quant_row_fp8_one` of that `y`. Return codes as
+// `scratchy_cuda_rms_norm_bf16`'s; refused, before any pointer is touched, unless `cols` is a
+// non-zero multiple of 64 and at most 17,408. `x`, `gain` and `y` 16-byte-aligned device pointers
+// to `cols` bf16, `q` to `cols` bytes and `scale` 4-byte aligned, no output overlapping an input
+// nor another output. `scratchy_cuda_rms_norm_bf16_prepare` must have succeeded. Asynchronous.
+extern "C" int scratchy_cuda_rms_norm_quant_fp8(const void* x, const void* gain, void* y, void* q,
+                                                void* scale, uint32_t cols, float eps,
+                                                float gain_offset,
+                                                void* stream /* cudaStream_t; null = default */) {
+    if (quant_refused(cols)) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        // `other` and `sum` are never read by this form; `x` and `y` are valid addresses for them.
+        return launch_quant<NORM>(x, gain, y, x, y, q, scale, cols, eps, gain_offset,
+                                  static_cast<cudaStream_t>(stream));
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}
+
+// FP8 S8 N2: `scratchy_cuda_add_rms_norm_bf16`'s one row (`sum = a + b`, `y = norm(sum)`) and the
+// next fp8 GEMM's input, `q` and `scale` of `y` as `scratchy_cuda_rms_norm_quant_fp8`'s. Return
+// codes and rule as that launcher's; `a`, `b`, `sum` 16-byte-aligned device pointers to `cols`
+// bf16 too, `sum` overlapping no input nor output.
+extern "C" int scratchy_cuda_add_rms_norm_quant_fp8(const void* a, const void* b, const void* gain,
+                                                    void* sum, void* y, void* q, void* scale,
+                                                    uint32_t cols, float eps, float gain_offset,
+                                                    void* stream /* cudaStream_t; null = default */) {
+    if (quant_refused(cols)) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        return launch_quant<ADD_NORM>(a, gain, y, b, sum, q, scale, cols, eps, gain_offset,
+                                      static_cast<cudaStream_t>(stream));
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }

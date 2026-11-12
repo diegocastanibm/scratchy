@@ -435,6 +435,30 @@ unsafe extern "C" {
         variant: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_rms_norm_quant_fp8(
+        x: *const c_void,
+        gain: *const c_void,
+        y: *mut c_void,
+        q: *mut c_void,
+        scale: *mut c_void,
+        cols: u32,
+        eps: f32,
+        gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_add_rms_norm_quant_fp8(
+        a: *const c_void,
+        b: *const c_void,
+        gain: *const c_void,
+        sum: *mut c_void,
+        y: *mut c_void,
+        q: *mut c_void,
+        scale: *mut c_void,
+        cols: u32,
+        eps: f32,
+        gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_rms_norm_unit_bf16(
         x: *const c_void,
         y: *mut c_void,
@@ -1691,6 +1715,66 @@ pub unsafe fn silu_mul_bf16(
     // SAFETY: as `rms_norm_bf16`'s.
     let code = unsafe { scratchy_cuda_silu_mul_bf16(gate, up, out, rows, cols, stream) };
     check(code, KernelError::RowShape { rows, cols })
+}
+
+/// One row's [`rms_norm_bf16`] and the next fp8 GEMM's input in one launch (FP8 S8 N2,
+/// `kernels/rms_norm_bf16.cu`'s quantized row form): `y [1, cols]` bf16 the norm's bits, and `q [1,
+/// cols]` e4m3 with `scale [1]` f32 [`quant_row_fp8_one`]'s of that `y`, bit for bit.
+/// Asynchronous; refused with [`KernelError::RowShape`] (`rows` 1) unless `cols` is a non-zero
+/// multiple of 64 at most 17,408.
+///
+/// # Safety
+///
+/// `x`, `gain` and `y` must be 16-byte-aligned device pointers to `cols` bf16, `q` to `cols` bytes
+/// and `scale` a 4-byte-aligned one to one f32, valid for the whole kernel, no output overlapping
+/// an input nor another output. `stream` must be a live `cudaStream_t` of the current device, or
+/// null for the default stream.
+pub unsafe fn rms_norm_quant_fp8(
+    (x, gain): (*const c_void, *const c_void),
+    (y, q, scale): (*mut c_void, *mut c_void, *mut c_void),
+    cols: u32,
+    (eps, gain_offset): (f32, f32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape before it touches a pointer.
+    let code = unsafe {
+        scratchy_cuda_rms_norm_quant_fp8(x, gain, y, q, scale, cols, eps, gain_offset, stream)
+    };
+    check(code, KernelError::RowShape { rows: 1, cols })
+}
+
+/// One row's [`add_rms_norm_bf16`] (`sum = a + b`, `y = norm(sum)`) and the next fp8 GEMM's input,
+/// `q` and `scale` of `y` as [`rms_norm_quant_fp8`]'s. Asynchronous; refused as that launcher.
+///
+/// # Safety
+///
+/// As [`rms_norm_quant_fp8`]'s, with `a`, `b` and `sum` 16-byte-aligned device pointers to `cols`
+/// bf16, `sum` overlapping no input nor output.
+pub unsafe fn add_rms_norm_quant_fp8(
+    (a, b): (*const c_void, *const c_void),
+    gain: *const c_void,
+    (sum, y, q, scale): (*mut c_void, *mut c_void, *mut c_void, *mut c_void),
+    cols: u32,
+    (eps, gain_offset): (f32, f32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as above; the launcher checks the shape before it touches a pointer.
+    let code = unsafe {
+        scratchy_cuda_add_rms_norm_quant_fp8(
+            a,
+            b,
+            gain,
+            sum,
+            y,
+            q,
+            scale,
+            cols,
+            eps,
+            gain_offset,
+            stream,
+        )
+    };
+    check(code, KernelError::RowShape { rows: 1, cols })
 }
 
 /// Launch the bf16 RMSNorm with no gain (Gemma's `v_norm`, `kernels/rms_norm_bf16.cu`'s unit
