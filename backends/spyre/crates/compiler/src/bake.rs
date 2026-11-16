@@ -2571,6 +2571,7 @@ pub(crate) fn dump_wavefront_mega(
             &bridge,
             scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(cap),
             primary_m,
+            scratchy_forward_compiler_macro::to_wavefront::DenseExperts::Refuse,
         )
     };
     let mut first = lower_at(prefix_len);
@@ -4703,6 +4704,7 @@ pub(crate) fn dump_wavefront_mega(
                     &bridge,
                     scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(prefix_len),
                     seqs,
+                    scratchy_forward_compiler_macro::to_wavefront::DenseExperts::Refuse,
                 ) {
                     Ok(lwd_b) => {
                         let lwd_b = bake_tape(stem, lwd_b);
@@ -5037,6 +5039,7 @@ pub(crate) fn dump_wavefront_mega(
                 // causally, and chunk k attends the k*mq rows written so far.
                 scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(prefix_len),
                 pl,
+                to_wavefront::DenseExperts::Refuse,
             );
             match lowered {
                 Ok(lwd_p) => {
@@ -5195,6 +5198,7 @@ pub(crate) fn dump_wavefront_mega(
                     &bridge,
                     scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(prefix_len),
                     m,
+                    scratchy_forward_compiler_macro::to_wavefront::DenseExperts::Refuse,
                 ) {
                     Ok(lwd_p) => {
                         let lwd_p = bake_tape(stem, lwd_p);
@@ -5375,6 +5379,7 @@ pub(crate) fn dump_wavefront_mega(
                 &bridge,
                 scratchy_forward_compiler_macro::to_wavefront::PrefixCapacity::new(prefix_len),
                 decode_mq,
+                scratchy_forward_compiler_macro::to_wavefront::DenseExperts::Refuse,
             ) {
                 Ok(lwd_cb) => {
                     let lwd_cb = bake_tape(stem, lwd_cb);
