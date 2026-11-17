@@ -37,6 +37,11 @@
 
 use std::path::PathBuf;
 
+// Force the linker to keep the compiled models (and thus their `CudaModelEntry`
+// `inventory::submit!`s): nothing here names the worker crate that anchors them, so without this
+// the registry is empty.
+extern crate scratchy_target_cuda_models as _;
+
 use scratchy_target_cuda::registry;
 use scratchy_target_cuda::runtime::{
     CudaDevice, CudaWorker, GdnPoolConfig, GdnSequence, Input, KvPoolConfig, KvSequence,
@@ -227,9 +232,21 @@ fn run(case: &Case) {
     // The model, as `serving::load_model` finds it: the first registered table the checkpoint's
     // header passes.
     let header = open_checkpoint(&dir).expect("the checkpoint's header");
+    let mut refusals = Vec::new();
     let entry = registry::entries()
-        .find(|e| check(e.weights, e.tapes, &header).is_ok())
-        .unwrap_or_else(|| panic!("no CUDA model in this build matches {}", dir.display()));
+        .find(|e| match check(e.weights, e.tapes, &header) {
+            Ok(()) => true,
+            Err(err) => {
+                refusals.push(format!("{}: {err}", e.stem));
+                false
+            }
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no CUDA model in this build matches {} (registered: {refusals:?})",
+                dir.display()
+            )
+        });
     drop(header);
     let weights = load_weights(&device, &dir, entry.tapes, entry.weights).expect("the weights");
 
