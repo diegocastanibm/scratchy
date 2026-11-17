@@ -47,7 +47,7 @@ use scratchy_target_cuda::runtime::{
     CudaDevice, CudaWorker, GdnPoolConfig, GdnSequence, Input, KvPoolConfig, KvSequence,
     load_weights,
 };
-use scratchy_target_cuda::step::CudaStep;
+use scratchy_target_cuda::step::{CudaStep, MoeWeight};
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, CudaTape};
 use scratchy_target_cuda::weights::{check, open_checkpoint};
 use serde_json::{Value, json};
@@ -258,8 +258,16 @@ fn run(case: &Case) {
     let m = tape.bucket_m;
     let probes = probes(tape, case.layers);
     let span = |offset: ArenaOffset, bytes: u64| ArenaSpan { offset, bytes };
+    // A MoE tape's tile rows are its bank's, which `validate` reads off its FP8 expert steps: a
+    // cut before the first one (Gemma's layer 0, its attention residual and its router) runs on
+    // to that step. What those two probes read is still live there: the attention residual until
+    // the layer's last add, the router's logits and top-k in the MoE region the sort leaves alone.
+    let first_fp8_expert = (tape.moe)
+        .and_then(|_| tape.steps.iter().position(fp8_expert))
+        .unwrap_or(0);
+    let cut_at = |last: usize| last.max(first_fp8_expert);
     let cut = |last: usize, result: ArenaSpan| CudaTape {
-        steps: &tape.steps[..=last],
+        steps: &tape.steps[..=cut_at(last)],
         result,
         greedy: None,
         ..*tape
@@ -369,14 +377,15 @@ fn run(case: &Case) {
                 gdn.as_ref(),
                 &mut result,
             )
-            .unwrap_or_else(|e| panic!("probe {b} (after step {last}): {e}"));
+            .unwrap_or_else(|e| panic!("probe {b} (after step {}): {e}", cut_at(last)));
         match probe {
             Probe::Residual {
                 layer, what, cols, ..
             } => {
                 let c = cols as usize;
                 let r = &result[row as usize * c..(row as usize + 1) * c];
-                residuals.push(json!({"layer": layer, "what": what, "row": bf16_to_f32(r)}));
+                residuals.push(json!({"layer": layer, "what": what, "step": last,
+                    "cut_at": cut_at(last), "row": bf16_to_f32(r)}));
             }
             Probe::Router {
                 layer,
@@ -402,7 +411,8 @@ fn run(case: &Case) {
                 let topk_ids: Vec<u32> = (idx.chunks(2))
                     .map(|w| u32::from(w[0]) | (u32::from(w[1]) << 16))
                     .collect();
-                routers.push(json!({"layer": layer, "logits": row_logits, "topk": topk_ids}));
+                routers.push(json!({"layer": layer, "step": last, "cut_at": cut_at(last),
+                    "logits": row_logits, "topk": topk_ids}));
             }
         }
     }
@@ -420,6 +430,15 @@ fn run(case: &Case) {
         residuals.len(),
         routers.len()
     );
+}
+
+/// An FP8 expert step: what `validate` reads a MoE tape's tile rows off.
+fn fp8_expert(s: &CudaStep) -> bool {
+    match s {
+        CudaStep::ExpertSortFp8(_) | CudaStep::ExpertActQuant(_) => true,
+        CudaStep::ExpertGemm(g) => matches!(g.weight, MoeWeight::Fp8Bundle | MoeWeight::Fp8Own),
+        _ => false,
+    }
 }
 
 /// Bytes per router logit in `tape`'s MoE region: its span over `[bucket_m, experts]`.
