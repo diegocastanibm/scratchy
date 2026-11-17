@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Gemma 4's row maps as one chain (#921): `x [m, 2816] → ScalarMul(√2816) → RmsNormUnit(1e-6) →
+//! Gemma 4's row maps as one chain (#921): `x [m, 2816] → ScalarMul(bf16(√2816)) → RmsNormUnit(1e-6) →
 //! ScalarWeightMul(w) → TanhSoftCap(30)`, each op one step of its own kernel. Not a Gemma layer:
 //! the four steps in one tape, so the tape player runs each against its standalone launcher.
 //!
@@ -23,10 +23,8 @@ pub const CAP: f32 = 30.0;
 /// The chain lowers with Gemma 4's facts.
 pub const GEMMA_ROWS_FACTS: CudaModelFacts = GEMMA4_FACTS;
 
-/// The embedding scale, `√H`.
-pub fn embed_scale() -> f32 {
-    (H as f32).sqrt()
-}
+/// The embedding scale, `√H` rounded to bf16 as the DSL's `sqrt_bf16(hidden_size)` folds it (#1282).
+pub const EMBED_SCALE: f32 = 53.0;
 
 /// The chain's ops at `m` rows.
 pub fn gemma_rows_input(m: u32) -> LoweringInput {
@@ -39,12 +37,7 @@ pub fn gemma_rows_input(m: u32) -> LoweringInput {
             SourceShape { rows: 1, cols: 1 },
         ],
         ops: vec![
-            op(
-                SubOp::ScalarMul {
-                    scale: embed_scale(),
-                },
-                vec![Ext(0)],
-            ),
+            op(SubOp::ScalarMul { scale: EMBED_SCALE }, vec![Ext(0)]),
             op(SubOp::RmsNormUnit { eps: EPS }, vec![Op(0)]),
             op(SubOp::ScalarWeightMul, vec![Op(1), Ext(1)]),
             op(SubOp::TanhSoftCap { cap: CAP }, vec![Op(2)]),
