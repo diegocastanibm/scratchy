@@ -2762,6 +2762,7 @@ name = "scratchy-target-cuda-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hf-hub-downloader",
  "inventory",
  "scratchy-core-common",
  "scratchy-core-model",

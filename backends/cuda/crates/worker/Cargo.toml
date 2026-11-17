@@ -46,7 +46,18 @@ tracing = { workspace = true }
 # The checkpoint's `quantization_config`, read as the raw JSON `HfModelConfig` keeps (`plan`).
 serde_json = { workspace = true }
 
+[dev-dependencies]
+# `e2_layers`: the checkpoint's snapshot in the local Hub cache.
+hf-hub-downloader = { path = "../../../../crates/core/hf-hub-downloader" }
+
 # The device argmax against `plan::greedy_token`, bit for bit (W7): an H100 test.
 [[test]]
 name = "argmax"
+required-features = ["nvcc"]
+
+# E2 of the Gemma 4 numerics review: per-layer residual rows and router picks of a real
+# checkpoint's prefill, recorded for a comparison against the exact reference. An H100 test,
+# `#[ignore]`d: it needs the checkpoint in the local Hub cache.
+[[test]]
+name = "e2_layers"
 required-features = ["nvcc"]
